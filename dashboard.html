@@ -326,14 +326,21 @@ function svgEl(tag, attrs = {}) {
   return node;
 }
 
-function niceTicks(max, count = 4) {
+// Ticks at round intervals covering [0, max].
+//
+// `cover` extends the top tick to at or above `max`, so the axis actually
+// contains the data. Without it the highest tick sits *below* the peak and
+// anything above it is flattened against the ceiling — on a 537K-token
+// session that silently hid 25% of the range.
+function niceTicks(max, count = 4, cover = false) {
   if (max <= 0) return [0];
   const raw = max / count;
   const mag = 10 ** Math.floor(Math.log10(raw));
   const norm = raw / mag;
   const step = (norm >= 5 ? 10 : norm >= 2 ? 5 : norm >= 1 ? 2 : 1) * mag;
   const ticks = [];
-  for (let v = 0; v <= max * 1.0001; v += step) ticks.push(v);
+  const limit = cover ? Math.ceil(max / step) * step : max * 1.0001;
+  for (let v = 0; v <= limit + step * 1e-9; v += step) ticks.push(v);
   return ticks;
 }
 
@@ -352,7 +359,9 @@ function renderDaily(daily) {
   const plotH = H - m.top - m.bottom;
 
   const max = Math.max(...days.map((d) => d.cost), 0.0001);
-  const ticks = niceTicks(max);
+  // Cover the data with a little headroom so the tallest column isn't clipped
+  // by the top gridline (see niceTicks).
+  const ticks = niceTicks(max * 1.06, 4, true);
   const top = ticks[ticks.length - 1];
   const y = (v) => m.top + plotH - (v / top) * plotH;
 
@@ -543,8 +552,8 @@ function renderSessionDetail(session, events) {
   const costMode = detailMode === 'cost';
 
   const W = Math.max(host.clientWidth || 720, 320);
-  const H = 260;
-  const m = { top: 12, right: 16, bottom: 30, left: costMode ? 68 : 62 };
+  const H = 420;
+  const m = { top: 16, right: 16, bottom: 30, left: costMode ? 68 : 62 };
   const plotW = W - m.left - m.right;
   const plotH = H - m.top - m.bottom;
   // A single re-cache of a large context can cost 30x the median call, which
@@ -559,8 +568,11 @@ function renderSessionDetail(session, events) {
   const costCeiling = costMax > p98 * 3 && p98 > 0 ? p98 * 1.15 : costMax;
   const clipped = costMode ? points.filter((p) => p.costTotal > costCeiling).length : 0;
 
+  // Headroom so the peak sits below the top gridline instead of against the
+  // frame, and `cover` so the top tick is at or above the data — otherwise the
+  // highest values get flattened by the y() clamp below.
   const max = costMode ? costCeiling : Math.max(...points.map((p) => p.total), 1);
-  const ticks = niceTicks(max);
+  const ticks = niceTicks(max * 1.06, 5, true);
   const top = ticks[ticks.length - 1];
   const x = (i) => m.left + (points.length === 1 ? plotW / 2 : (i / (points.length - 1)) * plotW);
   // Clamped so a clipped cost band stops at the plot ceiling instead of
