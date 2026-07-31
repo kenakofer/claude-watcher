@@ -1,0 +1,917 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Claude Code session watcher</title>
+<style>
+  /* Palette roles. Light values first; dark steps are selected for the dark
+     surface (not an automatic flip) and validated against it. */
+  :root {
+    color-scheme: light;
+    --surface-1: #fcfcfb;
+    --plane: #f9f9f7;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --border: rgba(11, 11, 11, 0.10);
+    --series-1: #2a78d6;  /* cache read   */
+    --series-2: #eb6834;  /* cache write  */
+    --series-3: #1baf7a;  /* output       */
+    --series-4: #eda100;  /* input        */
+    --good: #0ca30c;
+    --critical: #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface-1: #1a1a19;
+      --plane: #0d0d0d;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --muted: #898781;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --border: rgba(255, 255, 255, 0.10);
+      --series-1: #3987e5;
+      --series-2: #d95926;
+      --series-3: #199e70;
+      --series-4: #c98500;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --plane: #0d0d0d;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--plane);
+    color: var(--text-primary);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  a { color: inherit; }
+
+  header {
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    padding: 20px 24px 12px;
+  }
+  h1 { font-size: 17px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  .live {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--text-secondary);
+  }
+  .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--good); flex: none;
+  }
+  .dot.stale { background: var(--muted); }
+  .spacer { margin-left: auto; }
+  button.ghost {
+    font: inherit; font-size: 12px; color: var(--text-secondary);
+    background: transparent; border: 1px solid var(--border);
+    border-radius: 7px; padding: 5px 10px; cursor: pointer;
+  }
+  button.ghost:hover { background: var(--surface-1); }
+
+  main { padding: 0 24px 40px; display: grid; gap: 16px; }
+  .row { display: grid; gap: 16px; }
+  /* align-items:start so a collapsed panel keeps its own height instead of
+     stretching to match an expanded sibling. */
+  @media (min-width: 900px) {
+    .row.two { grid-template-columns: 1fr 1fr; align-items: start; }
+  }
+
+  .card {
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 18px;
+    min-width: 0;
+  }
+  .card h2 {
+    font-size: 12px; font-weight: 600; margin: 0;
+    color: var(--text-secondary); letter-spacing: 0.01em;
+  }
+  .card .sub { font-size: 12px; color: var(--muted); margin: 0 0 14px; }
+
+  /* Collapsible panels. The whole header row is the toggle, with a rotating
+     caret so the open/closed state is visible without relying on layout. */
+  .panel > summary {
+    display: flex; align-items: center; gap: 8px;
+    cursor: pointer; list-style: none; user-select: none;
+    margin: -2px 0; padding: 2px 0; border-radius: 6px;
+  }
+  .panel > summary::-webkit-details-marker { display: none; }
+  .panel > summary::before {
+    content: ''; flex: none;
+    width: 0; height: 0;
+    border-left: 5px solid var(--muted);
+    border-top: 4px solid transparent;
+    border-bottom: 4px solid transparent;
+    transition: transform .15s ease;
+  }
+  .panel[open] > summary::before { transform: rotate(90deg); }
+  .panel > summary:hover h2 { color: var(--text-primary); }
+  .panel > summary:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+  .panel-body { padding-top: 12px; }
+  /* Nested table-view disclosures keep the default marker but stay recessive. */
+  summary.minor { font-size: 12px; color: var(--text-secondary); cursor: pointer; }
+
+  /* Hero + stat tiles */
+  .tiles { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+  .tile .label { font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
+  .tile .value { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; }
+  .tile .value.hero { font-size: 48px; line-height: 1.05; }
+  .tile .meta { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+  svg { display: block; width: 100%; overflow: visible; }
+  .grid-line { stroke: var(--grid); stroke-width: 1; }
+  .axis-line { stroke: var(--axis); stroke-width: 1; }
+  .tick { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .axis-label { fill: var(--muted); font-size: 11px; }
+
+  /* Legend — always present for >= 2 series */
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 12px; }
+  .legend .item { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); }
+  .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tbody tr:hover { background: var(--plane); }
+  tbody tr.selected { background: var(--plane); }
+  .scroll { overflow-x: auto; }
+  .name { max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
+
+  .pill {
+    display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--text-secondary);
+  }
+  .muted { color: var(--muted); }
+  details { margin-top: 12px; }
+  summary { font-size: 12px; color: var(--text-secondary); cursor: pointer; }
+
+  /* Tooltip: enhances, never gates — every value is also in a table view. */
+  #tip {
+    position: fixed; pointer-events: none; opacity: 0; transition: opacity .08s;
+    background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; font-size: 12px; z-index: 50;
+    box-shadow: 0 6px 20px rgba(0,0,0,.16); max-width: 280px;
+  }
+  #tip .t-title { font-weight: 600; margin-bottom: 4px; }
+  #tip .t-row { display: flex; justify-content: space-between; gap: 14px; }
+  /* Keep the label on one line so the value column stays aligned; the tooltip
+     grows horizontally instead of wrapping a two-word label. */
+  #tip .t-row span:first-child { white-space: nowrap; }
+  #tip .t-row span:last-child { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+  .modes { display: flex; gap: 8px; margin: 0 0 12px; }
+  .modes button[aria-pressed="true"] {
+    color: var(--text-primary);
+    border-color: var(--text-secondary);
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Claude Code session watcher</h1>
+  <span class="live"><span class="dot" id="live-dot"></span><span id="live-text">connecting…</span></span>
+  <span class="spacer"></span>
+  <button class="ghost" id="theme-toggle" type="button">Theme</button>
+</header>
+
+<main>
+  <section class="card">
+    <div class="tiles" id="tiles"></div>
+  </section>
+
+  <details class="card panel" id="detail-card" open>
+    <summary><h2 id="detail-title">Session breakdown</h2></summary>
+    <div class="panel-body">
+      <p class="sub" id="detail-sub"></p>
+      <div class="modes" id="detail-modes">
+        <button class="ghost" type="button" data-mode="absolute">Tokens per turn</button>
+        <button class="ghost" type="button" data-mode="cost">Cost per turn</button>
+      </div>
+      <div id="detail-chart"><p class="empty">Loading…</p></div>
+      <div class="legend" id="detail-legend"></div>
+      <details>
+        <summary class="minor">Table view — model calls (last 40)</summary>
+        <div class="scroll"><table id="detail-table"></table></div>
+      </details>
+    </div>
+  </details>
+
+  <div class="row two">
+    <details class="card panel">
+      <summary><h2>Spend per day</h2></summary>
+      <div class="panel-body">
+        <p class="sub">Stacked by token type. Hover a column for the breakdown.</p>
+        <div id="daily"></div>
+        <div class="legend" id="daily-legend"></div>
+        <details>
+          <summary class="minor">Table view</summary>
+          <div class="scroll"><table id="daily-table"></table></div>
+        </details>
+      </div>
+    </details>
+
+    <details class="card panel">
+      <summary><h2>Cost by model</h2></summary>
+      <div class="panel-body">
+        <p class="sub">Total spend attributed per model.</p>
+        <div id="models"></div>
+        <details>
+          <summary class="minor">Table view</summary>
+          <div class="scroll"><table id="models-table"></table></div>
+        </details>
+      </div>
+    </details>
+  </div>
+
+  <details class="card panel" open>
+    <summary><h2>Sessions</h2></summary>
+    <div class="panel-body">
+      <p class="sub">Newest first. Select a row to chart its token usage per turn.</p>
+      <div class="scroll"><table id="sessions-table"></table></div>
+    </div>
+  </details>
+</main>
+
+<div id="tip" role="status" aria-live="polite"></div>
+
+<script type="module">
+const SVG = 'http://www.w3.org/2000/svg';
+const fmtUSD = (n) =>
+  n >= 100 ? '$' + n.toFixed(0) : n >= 1 ? '$' + n.toFixed(2) : '$' + n.toFixed(3);
+const fmtInt = (n) => n.toLocaleString('en-US');
+// Axis ticks for per-call costs, which are typically fractions of a cent.
+// Shows enough decimal places to keep adjacent ticks distinct.
+const fmtAxisUSD = (n) => {
+  if (n === 0) return '$0';
+  if (n >= 1) return '$' + n.toFixed(n >= 10 ? 0 : 1);
+  if (n >= 0.01) return '$' + n.toFixed(2);
+  if (n >= 0.001) return '$' + n.toFixed(3);
+  return '$' + n.toFixed(4);
+};
+// Precise per-call cost for tooltips and tables, where exactness matters more
+// than compactness. fmtUSD rounds sub-cent values to zero.
+const fmtExactUSD = (n) => (n === 0 ? '$0' : '$' + n.toFixed(n < 0.01 ? 5 : 4));
+const compact = (n) => {
+  const abs = Math.abs(n);
+  if (abs >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (abs >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (abs >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(n);
+};
+
+// Token-type series, in fixed slot order. Color follows the entity — never
+// reassigned by rank — so a series keeps its hue as data changes.
+const SERIES = [
+  { key: 'costCacheRead',  token: 'cacheReadTokens',       label: 'Cache read',  color: 'var(--series-1)' },
+  { key: 'costCacheWrite', token: 'cacheCreationTokens',   label: 'Cache write', color: 'var(--series-2)' },
+  { key: 'costOutput',     token: 'outputTokens',          label: 'Output',      color: 'var(--series-3)' },
+  { key: 'costInput',      token: 'inputTokens',           label: 'Input',       color: 'var(--series-4)' },
+];
+
+// Stack order for the per-session token chart, bottom band first. Cache read is
+// the largest and sits on the baseline so the smaller bands stay readable above
+// it; the hues match SERIES so a token type means the same color everywhere.
+const STACK = [
+  { token: 'cacheReadTokens',     cost: 'cacheRead',  label: 'Cache read',  color: 'var(--series-1)' },
+  { token: 'cacheCreationTokens', cost: 'cacheWrite', label: 'Cache write', color: 'var(--series-2)' },
+  { token: 'inputTokens',         cost: 'input',      label: 'Input',       color: 'var(--series-4)' },
+  { token: 'outputTokens',        cost: 'output',     label: 'Output',      color: 'var(--series-3)' },
+];
+
+const el = (id) => document.getElementById(id);
+const tip = el('tip');
+
+function showTip(evt, title, rows) {
+  tip.innerHTML =
+    `<div class="t-title">${title}</div>` +
+    rows.map(([k, v]) => `<div class="t-row"><span>${k}</span><span>${v}</span></div>`).join('');
+  tip.style.opacity = '1';
+  const pad = 14;
+  const rect = tip.getBoundingClientRect();
+  let x = evt.clientX + pad;
+  let y = evt.clientY + pad;
+  if (x + rect.width > innerWidth - 8) x = evt.clientX - rect.width - pad;
+  if (y + rect.height > innerHeight - 8) y = evt.clientY - rect.height - pad;
+  tip.style.left = Math.max(8, x) + 'px';
+  tip.style.top = Math.max(8, y) + 'px';
+}
+const hideTip = () => { tip.style.opacity = '0'; };
+
+function svgEl(tag, attrs = {}) {
+  const node = document.createElementNS(SVG, tag);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+  return node;
+}
+
+function niceTicks(max, count = 4) {
+  if (max <= 0) return [0];
+  const raw = max / count;
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  const norm = raw / mag;
+  const step = (norm >= 5 ? 10 : norm >= 2 ? 5 : norm >= 1 ? 2 : 1) * mag;
+  const ticks = [];
+  for (let v = 0; v <= max * 1.0001; v += step) ticks.push(v);
+  return ticks;
+}
+
+// --- Stacked column chart: spend per day ------------------------------------
+function renderDaily(daily) {
+  const host = el('daily');
+  host.innerHTML = '';
+  if (!daily.length) { host.innerHTML = '<p class="empty">No priced calls yet.</p>'; return; }
+
+  const days = daily.slice(-30);
+  const W = Math.max(host.clientWidth || 720, 320);
+  const H = 240;
+  // Reserve a band for the x-axis labels so the card never needs its own scroll.
+  const m = { top: 12, right: 12, bottom: 30, left: 52 };
+  const plotW = W - m.left - m.right;
+  const plotH = H - m.top - m.bottom;
+
+  const max = Math.max(...days.map((d) => d.cost), 0.0001);
+  const ticks = niceTicks(max);
+  const top = ticks[ticks.length - 1];
+  const y = (v) => m.top + plotH - (v / top) * plotH;
+
+  const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, height: H });
+
+  for (const t of ticks) {
+    svg.appendChild(svgEl('line', {
+      class: 'grid-line', x1: m.left, x2: m.left + plotW, y1: y(t), y2: y(t),
+    }));
+    const label = svgEl('text', { class: 'tick', x: m.left - 8, y: y(t) + 4, 'text-anchor': 'end' });
+    label.textContent = t >= 1 ? '$' + Math.round(t) : '$' + t.toFixed(2);
+    svg.appendChild(label);
+  }
+
+  const band = plotW / days.length;
+  const barW = Math.min(24, band * 0.62);
+  const GAP = 2; // surface gap between stacked segments
+
+  days.forEach((d, i) => {
+    const cx = m.left + band * (i + 0.5);
+    const x = cx - barW / 2;
+    let cursor = 0;
+
+    for (const s of SERIES) {
+      const value = d[s.key] || 0;
+      if (value <= 0) continue;
+      const yTop = y(cursor + value);
+      const yBottom = y(cursor);
+      const h = Math.max(0, yBottom - yTop - GAP);
+      if (h > 0) {
+        svg.appendChild(svgEl('rect', {
+          x, y: yTop, width: barW, height: h, rx: 2, fill: s.color,
+        }));
+      }
+      cursor += value;
+    }
+
+    // Hit target spans the full band so hovering never demands pixel precision.
+    const hit = svgEl('rect', {
+      x: m.left + band * i, y: m.top, width: band, height: plotH, fill: 'transparent',
+    });
+    hit.addEventListener('mousemove', (e) =>
+      showTip(e, d.day, [
+        ...SERIES.map((s) => [s.label, fmtUSD(d[s.key] || 0)]),
+        ['Total', fmtUSD(d.cost)],
+        ['Calls', fmtInt(d.calls)],
+      ]));
+    hit.addEventListener('mouseleave', hideTip);
+    svg.appendChild(hit);
+
+    // Label every ~5th day so ticks never collide.
+    if (days.length <= 10 || i % Math.ceil(days.length / 8) === 0) {
+      const t = svgEl('text', {
+        class: 'tick', x: cx, y: m.top + plotH + 18, 'text-anchor': 'middle',
+      });
+      t.textContent = d.day.slice(5);
+      svg.appendChild(t);
+    }
+  });
+
+  svg.appendChild(svgEl('line', {
+    class: 'axis-line', x1: m.left, x2: m.left + plotW,
+    y1: m.top + plotH, y2: m.top + plotH,
+  }));
+  host.appendChild(svg);
+
+  el('daily-legend').innerHTML = SERIES.map(
+    (s) => `<span class="item"><span class="swatch" style="background:${s.color}"></span>${s.label}</span>`,
+  ).join('');
+
+  el('daily-table').innerHTML =
+    '<thead><tr><th>Day</th>' +
+    SERIES.map((s) => `<th class="num">${s.label}</th>`).join('') +
+    '<th class="num">Total</th><th class="num">Calls</th></tr></thead><tbody>' +
+    days.map((d) =>
+      `<tr><td>${d.day}</td>` +
+      SERIES.map((s) => `<td class="num">${fmtUSD(d[s.key] || 0)}</td>`).join('') +
+      `<td class="num">${fmtUSD(d.cost)}</td><td class="num">${fmtInt(d.calls)}</td></tr>`,
+    ).join('') +
+    '</tbody>';
+}
+
+// --- Horizontal bars: one series, one color --------------------------------
+function renderBars(hostId, tableId, rows, opts) {
+  const host = el(hostId);
+  host.innerHTML = '';
+  if (!rows.length) { host.innerHTML = '<p class="empty">Nothing recorded yet.</p>'; return; }
+
+  const items = rows.slice(0, opts.limit || 8);
+  const rowH = 30;
+  const W = Math.max(host.clientWidth || 400, 280);
+  const labelW = Math.min(150, Math.max(90, W * 0.32));
+  const valueW = 68;
+  const plotW = Math.max(40, W - labelW - valueW - 8);
+  const H = items.length * rowH + 4;
+  const max = Math.max(...items.map(opts.value), 1e-9);
+
+  const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, height: H });
+
+  items.forEach((item, i) => {
+    const cy = i * rowH + rowH / 2;
+    const value = opts.value(item);
+    const w = Math.max(2, (value / max) * plotW);
+
+    const label = svgEl('text', {
+      class: 'axis-label', x: labelW - 10, y: cy + 4, 'text-anchor': 'end',
+    });
+    label.textContent = opts.label(item);
+    svg.appendChild(label);
+
+    svg.appendChild(svgEl('rect', {
+      x: labelW, y: cy - 7, width: w, height: 14, rx: 4, fill: 'var(--series-1)',
+    }));
+
+    // Direct label at the tip — selective by construction (one value per bar).
+    const out = svgEl('text', {
+      class: 'tick', x: labelW + w + 8, y: cy + 4, fill: 'var(--text-secondary)',
+    });
+    out.textContent = opts.display(item);
+    svg.appendChild(out);
+
+    const hit = svgEl('rect', { x: 0, y: i * rowH, width: W, height: rowH, fill: 'transparent' });
+    hit.addEventListener('mousemove', (e) => showTip(e, opts.label(item), opts.tip(item)));
+    hit.addEventListener('mouseleave', hideTip);
+    svg.appendChild(hit);
+  });
+
+  host.appendChild(svg);
+  el(tableId).innerHTML = opts.table(rows);
+}
+
+// --- Line chart: context window over a session ------------------------------
+function renderSessionDetail(session, events) {
+  detailData = { session, events };
+  for (const b of el('detail-modes').querySelectorAll('button')) {
+    b.setAttribute('aria-pressed', String(b.dataset.mode === detailMode));
+  }
+  el('detail-title').textContent =
+    `Session breakdown: ${session.title || session.sessionId.slice(0, 8)}`;
+  const started = session.firstTimestamp ? new Date(session.firstTimestamp).toLocaleString() : '—';
+  el('detail-sub').textContent =
+    `${session.project || 'unknown project'} · started ${started} · ` +
+    `${fmtInt(session.totals.calls)} calls · ${fmtUSD(session.totals.cost)} — ` +
+    (detailMode === 'cost'
+      ? 'cost per turn, stacked; band area is money at list API rates.'
+      : 'tokens per turn, stacked; the stack height is the context window.');
+
+  // Sort by timestamp rather than trusting ingest order. A resumed session's
+  // transcript can append entries out of chronological order (and subagent
+  // files are ingested whole), so plotting in file order would misplace both
+  // the trend and the compaction boundaries against it.
+  const calls = events
+    .filter((e) => e.kind === 'chat_completion' && e.timestamp)
+    .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  const host = el('detail-chart');
+  host.innerHTML = '';
+  if (!calls.length) { host.innerHTML = '<p class="empty">No model calls in this session.</p>'; return; }
+
+  // Each call's four token types, stacked. The stack total is the prompt the
+  // model actually saw, so the band inflates turn over turn as context grows
+  // and drops hard at a compaction — and because the types are stacked rather
+  // than summed into one line, you can also see the composition change there
+  // (cache read collapses; cache write spikes as the summary is re-cached).
+  const points = calls.map((e, i) => {
+    const parts = STACK.map((s) => e.usage[s.token] || 0);
+    const costs = STACK.map((s) => (e.cost && e.cost[s.cost]) || 0);
+    return {
+      i,
+      parts,
+      costs,
+      ctx: e.usage.inputTokens + e.usage.cacheReadTokens + e.usage.cacheCreationTokens,
+      total: parts.reduce((a, b) => a + b, 0),
+      costTotal: costs.reduce((a, b) => a + b, 0),
+      e,
+    };
+  });
+
+  // Two readings of the same stack:
+  //
+  //  - tokens: the stack height is the context window, so it shows the sawtooth
+  //    (context inflating turn over turn, dropping at a compaction). Cache read
+  //    is ~99% of a turn, so the other bands are near-invisible here.
+  //  - cost: each band is scaled by what that token type actually costs, so
+  //    area is money. This is not a normalization trick — an output token is
+  //    50x the price of a cache-read token on Opus, so the expensive-but-thin
+  //    bands rise into view on their own merits, and the chart answers "where
+  //    did the money go" rather than "where did the tokens go".
+  const costMode = detailMode === 'cost';
+
+  const W = Math.max(host.clientWidth || 720, 320);
+  const H = 260;
+  const m = { top: 12, right: 16, bottom: 30, left: costMode ? 68 : 62 };
+  const plotW = W - m.left - m.right;
+  const plotH = H - m.top - m.bottom;
+  // A single re-cache of a large context can cost 30x the median call, which
+  // would flatten every other call into the baseline. Clip the cost axis to a
+  // high percentile so the typical range stays readable; calls above the clip
+  // are drawn to the top and tagged so nothing is silently hidden. The token
+  // axis needs no clipping — the context window has a natural ceiling.
+  const costValues = points.map((p) => p.costTotal).sort((a, b) => a - b);
+  const p98 = costValues[Math.min(costValues.length - 1, Math.floor(costValues.length * 0.98))];
+  const costMax = Math.max(costValues[costValues.length - 1] || 0, 1e-6);
+  // Only clip when it actually buys headroom, and never below a real p98.
+  const costCeiling = costMax > p98 * 3 && p98 > 0 ? p98 * 1.15 : costMax;
+  const clipped = costMode ? points.filter((p) => p.costTotal > costCeiling).length : 0;
+
+  const max = costMode ? costCeiling : Math.max(...points.map((p) => p.total), 1);
+  const ticks = niceTicks(max);
+  const top = ticks[ticks.length - 1];
+  const x = (i) => m.left + (points.length === 1 ? plotW / 2 : (i / (points.length - 1)) * plotW);
+  // Clamped so a clipped cost band stops at the plot ceiling instead of
+  // drawing outside the chart area.
+  const y = (v) => m.top + plotH - (Math.min(v, top) / top) * plotH;
+
+  const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, height: H });
+
+  for (const t of ticks) {
+    svg.appendChild(svgEl('line', {
+      class: 'grid-line', x1: m.left, x2: m.left + plotW, y1: y(t), y2: y(t),
+    }));
+    const label = svgEl('text', { class: 'tick', x: m.left - 8, y: y(t) + 4, 'text-anchor': 'end' });
+    label.textContent = costMode ? fmtAxisUSD(t) : compact(t);
+    svg.appendChild(label);
+  }
+
+  // Compaction markers: the transcript reports these explicitly, so they are
+  // exact boundaries rather than a heuristic guess at a drop in the trend.
+  //
+  // Only markers that land inside the plotted call range are drawn. A session's
+  // compaction list can include boundaries outside it (a resumed session whose
+  // earlier calls aren't in this event list); clamping those to the first or
+  // last call would pile up markers at the edges and imply drops that the
+  // plotted data never shows. Anything out of range is reported in the legend
+  // instead of being drawn in the wrong place.
+  const firstCallTs = points[0].e.timestamp;
+  const lastCallTs = points[points.length - 1].e.timestamp;
+  const allCompactions = (session.compactions || []).map((c) => c.timestamp).filter(Boolean);
+  const inRange = allCompactions.filter(
+    (ts) => (!firstCallTs || ts >= firstCallTs) && (!lastCallTs || ts <= lastCallTs),
+  );
+
+  for (const ts of inRange) {
+    const idx = points.findIndex((p) => p.e.timestamp && p.e.timestamp >= ts);
+    if (idx < 0) continue;
+    svg.appendChild(svgEl('line', {
+      x1: x(idx), x2: x(idx), y1: m.top, y2: m.top + plotH,
+      stroke: 'var(--critical)', 'stroke-width': 1,
+    }));
+  }
+  const outOfRange = allCompactions.length - inRange.length;
+
+  // Stacked areas, drawn bottom band first. Each band is the region between
+  // the running total below it and the running total including it, so the
+  // outline of the whole stack is the context window.
+  const lower = new Array(points.length).fill(0);
+  STACK.forEach((s, si) => {
+    const upper = points.map((p, i) => lower[i] + (costMode ? p.costs[si] : p.parts[si]));
+
+    // Forward along the top edge, back along the bottom edge.
+    const top = points.map((p, i) => `${i ? 'L' : 'M'}${x(p.i)},${y(upper[i])}`).join(' ');
+    const bottom = points
+      .map((p, i) => `L${x(points[points.length - 1 - i].i)},${y(lower[points.length - 1 - i])}`)
+      .join(' ');
+
+    svg.appendChild(svgEl('path', {
+      d: `${top} ${bottom} Z`, fill: s.color, 'fill-opacity': 0.85, stroke: 'none',
+    }));
+
+    for (let i = 0; i < points.length; i += 1) lower[i] = upper[i];
+  });
+
+  // A thin line on the stack's top edge keeps the outline legible where the
+  // topmost bands are only a few pixels tall. In token mode that outline is
+  // the context window; in cost mode it is the per-call total spend.
+  const outline = points.map((p, i) => `${i ? 'L' : 'M'}${x(p.i)},${y(lower[i])}`).join(' ');
+  svg.appendChild(svgEl('path', {
+    d: outline, fill: 'none', stroke: 'var(--text-primary)',
+    'stroke-width': 1, 'stroke-opacity': 0.35, 'stroke-linejoin': 'round',
+  }));
+
+  const hit = svgEl('rect', {
+    x: m.left, y: m.top, width: plotW, height: plotH, fill: 'transparent',
+  });
+  hit.addEventListener('mousemove', (e) => {
+    const rect = svg.getBoundingClientRect();
+    const rel = ((e.clientX - rect.left) / rect.width) * W;
+    const ratio = (rel - m.left) / plotW;
+    const idx = Math.max(0, Math.min(points.length - 1, Math.round(ratio * (points.length - 1))));
+    const p = points[idx];
+    showTip(e, `Call ${idx + 1} of ${points.length}`, [
+      // Bands top-down, so the tooltip order matches what the eye sees.
+      ...STACK.map((s, si) => [
+        s.label,
+        costMode
+          ? `${fmtExactUSD(p.costs[si])} · ${compact(p.parts[si])} tok`
+          : fmtInt(p.parts[si]) + ' tok',
+      ]).reverse(),
+      costMode
+        ? [
+            'Call cost',
+            fmtExactUSD(p.costTotal) + (p.costTotal > costCeiling ? ' (clipped)' : ''),
+          ]
+        : ['Context window', fmtInt(p.ctx) + ' tok'],
+      ['Model', p.e.modelLabel || '—'],
+    ]);
+  });
+  hit.addEventListener('mouseleave', hideTip);
+  svg.appendChild(hit);
+
+  svg.appendChild(svgEl('line', {
+    class: 'axis-line', x1: m.left, x2: m.left + plotW, y1: m.top + plotH, y2: m.top + plotH,
+  }));
+  const xlab = svgEl('text', {
+    class: 'tick', x: m.left + plotW / 2, y: m.top + plotH + 20, 'text-anchor': 'middle',
+  });
+  xlab.textContent = costMode
+    ? 'model calls, in order — band area is money'
+    : 'model calls, in order';
+  svg.appendChild(xlab);
+
+  host.appendChild(svg);
+
+  el('detail-legend').innerHTML =
+    STACK.slice().reverse().map(
+      (s) => `<span class="item"><span class="swatch" style="background:${s.color}"></span>${s.label}</span>`,
+    ).join('') +
+    (inRange.length
+      ? `<span class="item"><span class="swatch" style="background:var(--critical)"></span>Compaction (${inRange.length})</span>`
+      : '') +
+    (outOfRange
+      ? `<span class="item muted">${outOfRange} compaction${outOfRange > 1 ? 's' : ''} outside the plotted calls</span>`
+      : '') +
+    (clipped
+      ? `<span class="item muted">${clipped} call${clipped > 1 ? 's' : ''} above ${fmtAxisUSD(costCeiling)} clipped to the top — hover for the real figure</span>`
+      : '');
+
+  // The table mirrors whichever mode is showing, so the chart's units and the
+  // table's units always agree.
+  el('detail-table').innerHTML =
+    '<thead><tr><th class="num">#</th><th>Model</th>' +
+    STACK.map((s) => `<th class="num">${s.label}</th>`).join('') +
+    (costMode
+      ? '<th class="num">Call cost</th>'
+      : '<th class="num">Context</th><th class="num">Cost</th>') +
+    '</tr></thead><tbody>' +
+    points.slice(-40).map((p) =>
+      `<tr><td class="num">${p.i + 1}</td><td>${p.e.modelLabel || '—'}</td>` +
+      STACK.map((s, si) =>
+        `<td class="num">${costMode ? fmtExactUSD(p.costs[si]) : fmtInt(p.parts[si])}</td>`,
+      ).join('') +
+      (costMode
+        ? `<td class="num">${fmtExactUSD(p.costTotal)}</td>`
+        : `<td class="num">${fmtInt(p.ctx)}</td><td class="num">${fmtExactUSD(p.e.cost.total)}</td>`) +
+      '</tr>',
+    ).join('') +
+    '</tbody>';
+}
+
+// --- Data plumbing ----------------------------------------------------------
+let stats = null;
+let sessions = [];
+let selectedId = null;
+let detailMode = 'absolute'; // 'absolute' (tokens) | 'cost'
+let detailData = null;       // last-rendered session payload, for re-render on toggle
+
+function renderTiles() {
+  const t = stats.totals;
+  const today = new Date().toISOString().slice(0, 10);
+  const todayRow = stats.daily.find((d) => d.day === today);
+  const cacheShare = t.cost > 0 ? ((t.costCacheRead + t.costCacheWrite) / t.cost) * 100 : 0;
+
+  el('tiles').innerHTML = `
+    <div class="tile">
+      <div class="label">Total spend</div>
+      <div class="value hero">${fmtUSD(t.cost)}</div>
+      <div class="meta">${fmtInt(t.sessions)} sessions · ${fmtInt(t.calls)} model calls</div>
+    </div>
+    <div class="tile">
+      <div class="label">Today</div>
+      <div class="value">${fmtUSD(todayRow ? todayRow.cost : 0)}</div>
+      <div class="meta">${todayRow ? fmtInt(todayRow.calls) + ' calls' : 'no calls yet'}</div>
+    </div>
+    <div class="tile">
+      <div class="label">Cache read tokens</div>
+      <div class="value">${compact(t.cacheReadTokens)}</div>
+      <div class="meta">${cacheShare.toFixed(0)}% of spend is cache</div>
+    </div>
+    <div class="tile">
+      <div class="label">Output tokens</div>
+      <div class="value">${compact(t.outputTokens)}</div>
+      <div class="meta">${fmtInt(t.prompts)} prompts · ${fmtInt(t.toolCalls)} tool calls</div>
+    </div>
+    <div class="tile">
+      <div class="label">Compactions</div>
+      <div class="value">${fmtInt(t.compactions)}</div>
+      <div class="meta">context resets across all sessions</div>
+    </div>`;
+}
+
+function renderSessions() {
+  const rows = sessions.slice(0, 60);
+  el('sessions-table').innerHTML =
+    '<thead><tr><th>Session</th><th>Project</th><th class="num">Calls</th>' +
+    '<th class="num">Context</th><th class="num">Cost</th><th>Last active</th></tr></thead><tbody>' +
+    rows.map((s) => {
+      const name = s.title || s.sessionId.slice(0, 8);
+      const when = s.lastTimestamp ? new Date(s.lastTimestamp).toLocaleString() : '—';
+      const project = (s.project || '').split('/').filter(Boolean).pop() || '—';
+      const badge = s.isSidechain
+        ? `<span class="pill">${s.agentType || 'subagent'}</span> `
+        : '';
+      return `<tr data-id="${encodeURIComponent(s.sessionId)}" ${s.sessionId === selectedId ? 'class="selected"' : ''}>
+        <td class="name">${badge}${name}</td>
+        <td class="name muted">${project}</td>
+        <td class="num">${fmtInt(s.totals.calls)}</td>
+        <td class="num">${s.contextWindow ? compact(s.contextWindow) : '—'}</td>
+        <td class="num">${fmtUSD(s.totals.cost)}</td>
+        <td class="muted">${when}</td>
+      </tr>`;
+    }).join('') +
+    '</tbody>';
+
+  for (const tr of el('sessions-table').querySelectorAll('tr[data-id]')) {
+    tr.style.cursor = 'pointer';
+    tr.addEventListener('click', () => selectSession(decodeURIComponent(tr.dataset.id)));
+  }
+}
+
+// `scroll` is opt-in: a user clicking a row wants to be taken to the chart,
+// but the auto-selection on load should leave the page where it is.
+async function selectSession(id, { scroll = true } = {}) {
+  selectedId = id;
+  renderSessions();
+  const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`);
+  if (!res.ok) return;
+  const data = await res.json();
+  renderSessionDetail(data.session, data.events);
+  if (scroll) el('detail-card').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+// Skip charts whose panel is collapsed — they'd measure 0 width and lay out
+// wrong. The `toggle` handler re-renders them when they're expanded.
+const panelOpen = (id) => {
+  const panel = el(id)?.closest('.panel');
+  return !panel || panel.open;
+};
+
+function renderAll() {
+  renderTiles();
+  if (panelOpen('daily')) renderDaily(stats.daily);
+
+  if (panelOpen('models')) renderBars('models', 'models-table', stats.models, {
+    value: (m) => m.cost,
+    label: (m) => m.label,
+    display: (m) => fmtUSD(m.cost),
+    tip: (m) => [
+      ['Cost', fmtUSD(m.cost)],
+      ['Calls', fmtInt(m.calls)],
+      ['Output', compact(m.outputTokens) + ' tok'],
+      ['Cache read', compact(m.cacheReadTokens) + ' tok'],
+    ],
+    table: (rows) =>
+      '<thead><tr><th>Model</th><th class="num">Calls</th><th class="num">Output</th>' +
+      '<th class="num">Cache read</th><th class="num">Cost</th></tr></thead><tbody>' +
+      rows.map((m) =>
+        `<tr><td>${m.label}</td><td class="num">${fmtInt(m.calls)}</td>` +
+        `<td class="num">${fmtInt(m.outputTokens)}</td>` +
+        `<td class="num">${fmtInt(m.cacheReadTokens)}</td>` +
+        `<td class="num">${fmtUSD(m.cost)}</td></tr>`).join('') +
+      '</tbody>',
+  });
+
+  renderSessions();
+}
+
+async function refresh() {
+  const [s, sess] = await Promise.all([
+    fetch('/api/stats').then((r) => r.json()),
+    fetch('/api/sessions').then((r) => r.json()),
+  ]);
+  stats = s;
+  sessions = sess;
+
+  // Open on the most recent session that actually has model calls, so the
+  // breakdown panel is populated rather than empty on first paint. A session
+  // that was resumed but never prompted has zero calls and nothing to chart.
+  if (!selectedId) {
+    const first = sessions.find((x) => x.totals.calls > 0);
+    if (first) selectedId = first.sessionId;
+  }
+
+  renderAll();
+
+  if (selectedId) {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(selectedId)}`);
+    if (res.ok) {
+      const data = await res.json();
+      renderSessionDetail(data.session, data.events);
+    }
+  }
+}
+
+function setLive(ok, text) {
+  el('live-dot').className = 'dot' + (ok ? '' : ' stale');
+  el('live-text').textContent = text;
+}
+
+// SSE keeps the page live; each batch triggers a debounced refetch of the
+// aggregates rather than re-deriving them client-side.
+let pending = null;
+function connect() {
+  const es = new EventSource('/stream');
+  es.onopen = () => setLive(true, 'live');
+  es.onmessage = () => {
+    clearTimeout(pending);
+    pending = setTimeout(() => {
+      refresh().catch(() => {});
+      setLive(true, 'live · updated ' + new Date().toLocaleTimeString());
+    }, 400);
+  };
+  es.onerror = () => {
+    setLive(false, 'reconnecting…');
+    es.close();
+    setTimeout(connect, 3000);
+  };
+}
+
+// A chart rendered inside a collapsed <details> measures clientWidth as 0 and
+// lays out wrong. Re-render on expand so a panel that was collapsed at load
+// (or during a refresh) sizes itself correctly the first time it's opened.
+for (const panel of document.querySelectorAll('.panel')) {
+  panel.addEventListener('toggle', () => {
+    if (!panel.open) return;
+    if (panel.id === 'detail-card') {
+      if (detailData) renderSessionDetail(detailData.session, detailData.events);
+    } else if (stats) {
+      renderAll();
+    }
+  });
+}
+
+el('detail-modes').addEventListener('click', (e) => {
+  const button = e.target.closest('button[data-mode]');
+  if (!button || button.dataset.mode === detailMode) return;
+  detailMode = button.dataset.mode;
+  if (detailData) renderSessionDetail(detailData.session, detailData.events);
+});
+
+el('theme-toggle').addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const prefersDark = matchMedia('(prefers-color-scheme: dark)').matches;
+  const next = current ? (current === 'dark' ? 'light' : 'dark') : (prefersDark ? 'light' : 'dark');
+  document.documentElement.setAttribute('data-theme', next);
+  renderAll();
+});
+
+addEventListener('resize', () => { if (stats) renderAll(); });
+
+refresh().then(connect).catch(() => setLive(false, 'watcher unreachable'));
+</script>
+</body>
+</html>

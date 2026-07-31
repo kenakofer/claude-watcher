@@ -1,0 +1,11 @@
+node_modules/
+*.log
+.DS_Store
+data/
+
+# Machine-local Claude Code settings (contains absolute paths).
+.claude/settings.local.json
+
+# Screenshots are generated from real local session history; review before
+# publishing. Remove this line once docs/ holds images you're happy to share.
+docs/
