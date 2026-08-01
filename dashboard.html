@@ -766,8 +766,101 @@ function renderSessionDetail(session, events) {
   // frame, and `cover` so the top tick is at or above the data — otherwise the
   // highest values get flattened by the y() clamp below.
   const max = costMode ? costCeiling : Math.max(...points.map((p) => p.total), 1);
-  const ticks = niceTicks(max * 1.06, 5, true);
-  const top = ticks[ticks.length - 1];
+  // Provisional: sizes the money grid below, and is the final answer in token
+  // mode. Cost mode replaces the tick positions once the cell is known, but
+  // keeps this `top` so the axis ceiling (and the y() clamp) are unchanged.
+  const baseTicks = niceTicks(max * 1.06, 5, true);
+  const top = baseTicks[baseTicks.length - 1];
+  // --- Money grid sizing ------------------------------------------------
+  //
+  // Sized here, ahead of the gridlines, because in cost mode the gridlines are
+  // derived from the cell rather than the other way round. See the tick block
+  // below for why.
+  //
+  // Cost mode already means "band area is money": the y axis is dollars per
+  // call and the x axis is calls, so a region's width x height carries units of
+  // dollars. That makes a grid cell a *quantity of money*, and counting cells
+  // under the stack estimates the spend directly.
+  //
+  // Cells are square in pixels, so the eye can count them without mentally
+  // correcting for a stretched aspect. Solving side^2 = cell$ x px-per-call x
+  // px-per-dollar gives the side for a given cell value.
+  //
+  // Powers of ten only, rather than a finer 1-2-5 ladder: a decade step keeps
+  // the label a plain "$1" or "$10" instead of "$0.05" or "$50", and mental
+  // arithmetic over the squares stays trivial.
+  //
+  // The ladder starts at $1 — no sub-dollar cells. A grid whose unit is $0.001
+  // is technically well-sized but practically meaningless: "count the squares"
+  // stops being a useful gesture when a square is a tenth of a cent.
+  let moneyGrid = null;
+  if (costMode) {
+    const MONEY_GRID_TARGET_PX = 42;
+    const pxPerCall = plotW / points.length;
+    const pxPerDollar = plotH / top;
+    for (let e = 0; e <= 4; e += 1) {
+      const value = 10 ** e;
+      const side = Math.sqrt(value * pxPerCall * pxPerDollar);
+      const score = Math.abs(Math.log(side / MONEY_GRID_TARGET_PX));
+      if (!moneyGrid || score < moneyGrid.score) moneyGrid = { value, side, score };
+    }
+  }
+
+  // Needs at least ~2 cells on each axis to read as a grid. Without the upper
+  // bound the $1 floor would draw a single line across an otherwise empty plot
+  // on short sessions, which looks like a rendering bug rather than a unit.
+  const gridFits = moneyGrid
+    && Number.isFinite(moneyGrid.side)
+    && moneyGrid.side > 4
+    && moneyGrid.side <= plotW / 2
+    && moneyGrid.side <= plotH / 2;
+
+  // Gridlines on cell boundaries.
+  //
+  // The cell is $1 of *area* (dollars x calls) but the y axis measures dollars
+  // of *height*, and the cell's height in dollars — sqrt(value x px-per-call /
+  // px-per-dollar) — has no reason to divide a round $0.10 tick step. On a
+  // typical session it comes out near $0.173, so round ticks cut the grid at
+  // arbitrary fractions of a cell and the two systems visibly disagree.
+  //
+  // Neither the cell size nor the chart height can fix that: the cell must stay
+  // pixel-square to be countable, and the misalignment scales as sqrt(height),
+  // so even large height changes barely move it. So the ticks give way instead
+  // — placed every `g` cells, which makes them land on cell edges exactly, at
+  // any width, height, or call count. The cost is the axis labels, which stop
+  // being round numbers ($0.17, $0.35 rather than $0.10, $0.20). Worth it: the
+  // dollar figures that get *read* are the headline total and the cumulative
+  // axis, while the left axis is mostly a scale reference, and a scale that
+  // agrees with the grid drawn over it is worth more than round labels.
+  //
+  // `g` targets ~80px spacing and 2-7 lines; the fallback keeps token mode and
+  // any session with no drawable grid on the original round ticks.
+  let ticks = baseTicks;
+  let cellDollars = 0;
+  if (gridFits) {
+    const pxPerDollar = plotH / top;
+    cellDollars = moneyGrid.side / pxPerDollar;
+    let chosen = null;
+    for (let g = 1; g <= 8; g += 1) {
+      const px = g * moneyGrid.side;
+      const count = Math.floor(plotH / px + 1e-9);
+      if (count < 2 || count > 7) continue;
+      const cost = Math.abs(Math.log(px / 80));
+      if (!chosen || cost < chosen.cost) chosen = { g, count, cost };
+    }
+    if (chosen) {
+      ticks = [];
+      for (let j = 0; j <= chosen.count; j += 1) ticks.push(j * chosen.g * cellDollars);
+    }
+  }
+  // One precision for the whole axis, taken from the step rather than from each
+  // value: fmtAxisUSD switches decimals by magnitude, which on a derived axis
+  // prints "$0.49 $0.98 $1.5 $2.0" — the decimals changing partway down a
+  // single column. Same reasoning as the cumulative axis below.
+  const tickStep = ticks.length > 1 ? ticks[1] - ticks[0] : 0;
+  const tickDp = tickStep >= 1 ? 2 : tickStep >= 0.1 ? 2 : tickStep >= 0.01 ? 3 : 4;
+  const fmtLeft = (v) => (ticks === baseTicks ? fmtAxisUSD(v) : '$' + v.toFixed(tickDp));
+
   // Bars sit in evenly divided bands; the area path spans edge to edge so the
   // trend reaches both sides of the plot.
   const useBars = points.length < BAR_MODE_MAX_CALLS;
@@ -812,7 +905,7 @@ function renderSessionDetail(session, events) {
       class: 'grid-line', x1: m.left, x2: m.left + plotW, y1: gy, y2: gy,
     }));
     const label = svgEl('text', { class: 'tick', x: m.left - 8, y: gy + 4, 'text-anchor': 'end' });
-    label.textContent = costMode ? fmtAxisUSD(t) : compact(t);
+    label.textContent = costMode ? fmtLeft(t) : compact(t);
     svg.appendChild(label);
 
     // Same gridline, right-hand side: the cumulative value at that height.
@@ -959,54 +1052,8 @@ function renderSessionDetail(session, events) {
 
   // --- Money grid -----------------------------------------------------------
   //
-  // Cost mode already means "band area is money": the y axis is dollars per
-  // call and the x axis is calls, so a region's width x height carries units of
-  // dollars. That makes a grid cell a *quantity of money*, and counting cells
-  // under the stack estimates the spend directly. This draws that unit.
-  //
-  // Cells are square in pixels, so the eye can count them without mentally
-  // correcting for a stretched aspect. Solving side^2 = cell$ x px-per-call x
-  // px-per-dollar gives the side for a given cell value.
-  //
-  // The cell value steps in powers of ten to land the side near TARGET px, and
-  // the chosen value is stated in the legend so the unit is never ambiguous.
-  //
-  // Powers of ten only, rather than a finer 1-2-5 ladder: a decade step keeps
-  // the label a plain "$1" or "$10" instead of "$0.05" or "$50", and mental
-  // arithmetic over the squares stays trivial.
-  //
-  // The ladder starts at $1 — no sub-dollar cells. A grid whose unit is $0.001
-  // is technically well-sized but practically meaningless: "count the squares"
-  // stops being a useful gesture when a square is a tenth of a cent, and the
-  // legend reads as noise. $1 is the smallest unit anyone actually reasons in,
-  // so it is the floor even where a smaller cell would fit the plot better.
-  //
-  // Consequence, and why the guard below has an upper bound: on a short or
-  // cheap session a $1 cell can be larger than the plot (up to ~1968px across
-  // these sessions, against a plot ~836px wide). That is not a grid, it is one
-  // stray line, so those sessions draw no grid at all rather than a misleading
-  // fragment. About a third of sessions here land that way.
-  let moneyGrid = null;
-  if (costMode) {
-    const MONEY_GRID_TARGET_PX = 42;
-    const pxPerCall = plotW / points.length;
-    const pxPerDollar = plotH / top;
-    for (let e = 0; e <= 4; e += 1) {
-      const value = 10 ** e;
-      const side = Math.sqrt(value * pxPerCall * pxPerDollar);
-      const score = Math.abs(Math.log(side / MONEY_GRID_TARGET_PX));
-      if (!moneyGrid || score < moneyGrid.score) moneyGrid = { value, side, score };
-    }
-  }
-
-  // Needs at least ~2 cells on each axis to read as a grid. Without the upper
-  // bound the $1 floor would draw a single line across an otherwise empty plot
-  // on short sessions, which looks like a rendering bug rather than a unit.
-  const gridFits = moneyGrid
-    && Number.isFinite(moneyGrid.side)
-    && moneyGrid.side > 4
-    && moneyGrid.side <= plotW / 2
-    && moneyGrid.side <= plotH / 2;
+  // Sized and aligned further up, before the gridlines that are derived from
+  // it. This block only draws it.
   if (gridFits) {
     const side = moneyGrid.side;
     const defs = svgEl('defs');
@@ -1017,6 +1064,10 @@ function renderSessionDetail(session, events) {
     // Lines are anchored to the axes (bottom-left), not the top-left, so a cell
     // boundary always sits on $0 and on the first call. Otherwise the grid
     // would float against the very axes it is supposed to be measuring.
+    //
+    // This anchoring is also what makes the derived gridlines land exactly on
+    // cell edges: both count upward from $0 in whole cells, so tick j sits on
+    // the (j x g)th cell boundary with no accumulated drift.
     const pattern = svgEl('pattern', {
       id: `${uid}-p`, width: side, height: side,
       patternUnits: 'userSpaceOnUse',
