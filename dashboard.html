@@ -134,6 +134,30 @@
   }
   .card .sub { font-size: 12px; color: var(--muted); margin: 0 0 14px; }
 
+  /* Session total as a headline, opposite the descriptive line. Baseline
+     alignment, not centre: the two have very different type sizes, and sitting
+     them on a shared baseline is what makes the pairing read as one row. The
+     margin moves from .sub to the flex row so both children can be flush. */
+  .detail-head {
+    display: flex; align-items: baseline; gap: 16px;
+    flex-wrap: wrap; margin: 0 0 14px;
+  }
+  .detail-head .sub { margin: 0; flex: 1 1 240px; }
+  .detail-head .headline {
+    margin: 0; margin-left: auto; text-align: right;
+    font-size: 26px; font-weight: 600; line-height: 1.1;
+    color: var(--text-primary); font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+  .detail-head .headline-label {
+    display: block; font-size: 11px; font-weight: 500;
+    color: var(--muted); letter-spacing: 0.02em;
+    margin-top: 2px;
+  }
+  /* Pulled out of the legend, where it was one muted item among many and read
+     as a series rather than as instructions for reading the plot. */
+  .grid-note { margin: -8px 0 12px; }
+
   /* Collapsible panels. The whole header row is the toggle, with a rotating
      caret so the open/closed state is visible without relying on layout. */
   .panel > summary {
@@ -249,7 +273,11 @@
   <details class="card panel" id="detail-card" open>
     <summary><h2 id="detail-title">Session breakdown</h2></summary>
     <div class="panel-body">
-      <p class="sub" id="detail-sub"></p>
+      <div class="detail-head">
+        <p class="sub" id="detail-sub"></p>
+        <p class="headline" id="detail-total"></p>
+      </div>
+      <p class="sub grid-note" id="detail-grid-note" hidden></p>
       <div class="modes" id="detail-modes">
         <button class="ghost" type="button" data-mode="absolute">Tokens per turn</button>
         <button class="ghost" type="button" data-mode="cost">Cost per turn</button>
@@ -621,12 +649,22 @@ function renderSessionDetail(session, events) {
   const started = session.firstTimestamp ? new Date(session.firstTimestamp).toLocaleString() : '—';
   const ttl = cacheTtl(session.totals);
   const ttlNote = ttl.kind === 'none' ? '' : ` · ${ttl.label} cache TTL`;
+  // Cost mode carries no caption: the mode buttons and the dollar axis already
+  // say what is plotted. Token mode keeps one clause, because "the stack height
+  // is the context window" is a reading of the geometry you can't get from the
+  // axis alone.
   el('detail-sub').textContent =
     `${session.project || 'unknown project'} · started ${started} · ` +
-    `${fmtInt(session.totals.calls)} calls · ${fmtUSD(session.totals.cost)}${ttlNote} — ` +
+    `${fmtInt(session.totals.calls)} calls${ttlNote}` +
     (detailMode === 'cost'
-      ? 'cost per turn, stacked; band area is money at list API rates.'
-      : 'tokens per turn, stacked; the stack height is the context window.');
+      ? ''
+      : ' — tokens per turn, stacked; the stack height is the context window.');
+  // The total moves out of the descriptive line and into the headline, so it
+  // isn't the one number you have to read a sentence to find. It stays labelled
+  // because a bare dollar figure at this size could be read as a rate or a
+  // budget rather than what this session has cost.
+  el('detail-total').innerHTML =
+    `${fmtUSD(session.totals.cost)}<span class="headline-label">session total</span>`;
 
   // Sort by timestamp rather than trusting ingest order. A resumed session's
   // transcript can append entries out of chronological order (and subagent
@@ -637,7 +675,14 @@ function renderSessionDetail(session, events) {
     .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
   const host = el('detail-chart');
   host.innerHTML = '';
-  if (!calls.length) { host.innerHTML = '<p class="empty">No model calls in this session.</p>'; return; }
+  // The note outlives the chart it describes, so this path has to clear it
+  // explicitly — otherwise the previous session's grid square is left pointing
+  // at an empty panel.
+  if (!calls.length) {
+    el('detail-grid-note').hidden = true;
+    host.innerHTML = '<p class="empty">No model calls in this session.</p>';
+    return;
+  }
 
   // Each call's four token types, stacked. The stack total is the prompt the
   // model actually saw, so the band inflates turn over turn as context grows
@@ -1012,6 +1057,45 @@ function renderSessionDetail(session, events) {
       // why it is a light touch rather than the old 0.45.
       'fill-opacity': 0.85, 'pointer-events': 'none',
     }));
+
+    // A single filled cell, drawn at exactly `side` so it is the unit rather
+    // than a picture of it — the eye can carry this square out into the plot and
+    // match it against the grid without any scaling.
+    //
+    // Anchored to the pattern's own phase, not to the plot corner: the grid is
+    // aligned to the bottom-left, so an arbitrary top-left offset would put the
+    // key a fraction of a cell out of step with every line around it and read as
+    // a rendering fault. Stepping down whole cells from the pattern origin keeps
+    // it flush, and one cell in from the left leaves the y-axis labels clear.
+    const gridOriginY = m.top + plotH - Math.ceil(plotH / side) * side;
+    let keyY = gridOriginY;
+    while (keyY < m.top + 2) keyY += side;
+    const keyX = m.left + side;
+    // Only when the key clears the plot: on a chart two cells tall it would sit
+    // on top of the data it is meant to explain.
+    if (keyY + side <= m.top + plotH && keyX + side <= m.left + plotW) {
+      svg.appendChild(svgEl('rect', {
+        x: keyX, y: keyY, width: side, height: side,
+        fill: 'var(--money-grid)', 'fill-opacity': 0.28,
+        stroke: 'var(--money-grid)', 'stroke-width': 1.5,
+        'pointer-events': 'none',
+      }));
+      // Value inside the square when it is big enough to hold the text, beside
+      // it when it isn't — at the small end of the ladder a centred label would
+      // overflow its own cell.
+      const label = `$${moneyGrid.value.toFixed(Math.max(0, -Math.round(Math.log10(moneyGrid.value))))}`;
+      const fits = side >= 34;
+      const text = svgEl('text', {
+        class: 'tick',
+        x: fits ? keyX + side / 2 : keyX + side + 6,
+        y: fits ? keyY + side / 2 + 4 : keyY + side / 2 + 4,
+        'text-anchor': fits ? 'middle' : 'start',
+        fill: 'var(--money-grid)', 'pointer-events': 'none',
+      });
+      text.setAttribute('font-weight', '600');
+      text.textContent = label;
+      svg.appendChild(text);
+    }
   }
 
   // Cumulative cost, overlaid on its own scale. Drawn after the bands so it
@@ -1077,12 +1161,12 @@ function renderSessionDetail(session, events) {
   const xlab = svgEl('text', {
     class: 'tick', x: m.left + plotW / 2, y: m.top + plotH + 20, 'text-anchor': 'middle',
   });
+  // Only labelled while zoomed, where it says which slice you are looking at.
+  // Unzoomed, the axis is self-evidently the calls in order and needs no caption.
   const zoomed = Boolean(detailZoom);
-  xlab.textContent =
-    (zoomed
-      ? `calls ${view.start + 1}–${view.end} of ${allPoints.length}`
-      : 'model calls, in order') +
-    (costMode ? ' — band area is money' : '');
+  xlab.textContent = zoomed
+    ? `calls ${view.start + 1}–${view.end} of ${allPoints.length}`
+    : '';
   svg.appendChild(xlab);
 
   // --- Zoom interactions ----------------------------------------------------
@@ -1167,30 +1251,29 @@ function renderSessionDetail(session, events) {
 
   host.appendChild(svg);
 
+  // The swatch on the plot now carries the unit and its value, so this line is
+  // left with only what a square cannot show: how to count it. Bar mode draws
+  // columns at 70% of their band, so the *ink* is 70% of the area it represents
+  // and a naive count runs ~30% low; only the gapless area mode can be counted
+  // directly.
+  //
+  // `gridFits`, not `moneyGrid`: a value is always chosen, but it is only drawn
+  // when it fits the plot. Keying the note off the value alone would describe a
+  // square that is nowhere on screen.
+  const gridNote = el('detail-grid-note');
+  gridNote.hidden = !gridFits;
+  if (gridFits) {
+    gridNote.textContent = useBars
+      ? 'Each square is one unit of spend — measured per column band, not the drawn bar width.'
+      : 'Each square is one unit of spend — count the squares under the curve.';
+  }
+
   el('detail-legend').innerHTML =
     STACK.slice().reverse().map(
       (s) => `<span class="item"><span class="swatch" style="background:${s.color}"></span>${s.label}</span>`,
     ).join('') +
     `<span class="item"><span class="swatch" style="background:var(--cumulative)"></span>` +
     `Spent so far — right axis (${fmtExactUSD(cumHi)})</span>` +
-    // Two things this line has to get right:
-    //
-    //  - Bar mode draws columns at 70% of their band, so the *ink* is 70% of
-    //    the area it represents; only the gapless area mode can be counted
-    //    directly. Say which reading applies rather than letting a naive count
-    //    run ~30% low.
-    //  - The value is always an exact power of ten, so print just enough
-    //    decimals to show it and no more: fmtAxisUSD would render these as
-    //    "$1.0" and "$0.0010", trailing digits implying a precision the value
-    //    doesn't have.
-    // `gridFits`, not `moneyGrid`: a value is always chosen, but it is only
-    // drawn when it fits the plot. Keying the legend off the value alone would
-    // announce a grid square that is nowhere on screen.
-    (gridFits
-      ? `<span class="item muted">Grid square = ` +
-        `$${moneyGrid.value.toFixed(Math.max(0, -Math.round(Math.log10(moneyGrid.value))))} of spend` +
-        `${useBars ? ' (per column band, not the drawn bar width)' : ' — count squares under the curve'}</span>`
-      : '') +
     (inRange.length
       ? `<span class="item"><span class="swatch" style="background:var(--critical)"></span>Compaction (${inRange.length})</span>`
       : '') +
