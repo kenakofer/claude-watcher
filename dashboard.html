@@ -182,11 +182,21 @@
   #tip .t-row span:first-child { white-space: nowrap; }
   #tip .t-row span:last-child { font-variant-numeric: tabular-nums; white-space: nowrap; }
   .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
-  .modes { display: flex; gap: 8px; margin: 0 0 12px; }
+  .modes { display: flex; gap: 8px; margin: 0 0 12px; align-items: center; }
   .modes button[aria-pressed="true"] {
     color: var(--text-primary);
     border-color: var(--text-secondary);
   }
+  .modes button[disabled] { opacity: 0.4; cursor: default; }
+  .modes button[disabled]:hover { background: transparent; }
+  .modes button[data-zoom="in"], .modes button[data-zoom="out"] {
+    font-size: 14px; line-height: 1; padding: 5px 11px;
+  }
+  .zoom-hint {
+    font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+  /* Drag-to-pan would otherwise select the axis labels mid-gesture. */
+  #detail-chart svg { user-select: none; -webkit-user-select: none; touch-action: pan-y; }
 </style>
 </head>
 <body>
@@ -209,11 +219,16 @@
       <div class="modes" id="detail-modes">
         <button class="ghost" type="button" data-mode="absolute">Tokens per turn</button>
         <button class="ghost" type="button" data-mode="cost">Cost per turn</button>
+        <span class="spacer"></span>
+        <span class="zoom-hint" id="detail-zoom-hint"></span>
+        <button class="ghost" type="button" data-zoom="out" title="Zoom out">−</button>
+        <button class="ghost" type="button" data-zoom="in" title="Zoom in">+</button>
+        <button class="ghost" type="button" data-zoom="reset" title="Show all calls">Reset</button>
       </div>
       <div id="detail-chart"><p class="empty">Loading…</p></div>
       <div class="legend" id="detail-legend"></div>
       <details>
-        <summary class="minor">Table view — model calls (last 40)</summary>
+        <summary class="minor" id="detail-table-label">Table view — model calls (last 40)</summary>
         <div class="scroll"><table id="detail-table"></table></div>
       </details>
     </div>
@@ -499,10 +514,43 @@ function renderBars(hostId, tableId, rows, opts) {
 // their own gaps, so the stacked area reads better as a trend.
 const BAR_MODE_MAX_CALLS = 400;
 
+// Never zoom in past this many calls: below it the columns are wide enough
+// that further zoom just adds whitespace without revealing anything.
+const MIN_ZOOM_CALLS = 4;
+
+// Clamp a proposed window to the data and to the minimum span, keeping it
+// inside [0, n]. Returns null for "the whole range", so the un-zoomed state has
+// exactly one representation and the reset button can rely on it.
+function clampZoom(range, n) {
+  if (!range) return null;
+  let { start, end } = range;
+  const minSpan = Math.min(MIN_ZOOM_CALLS, n);
+  if (end - start < minSpan) {
+    // Grow around the middle, then push back inside the bounds below.
+    const mid = (start + end) / 2;
+    start = mid - minSpan / 2;
+    end = start + minSpan;
+  }
+  start = Math.round(start);
+  end = Math.round(end);
+  if (start < 0) { end -= start; start = 0; }
+  if (end > n) { start -= end - n; end = n; }
+  start = Math.max(0, start);
+  if (end - start >= n) return null;
+  return { start, end };
+}
+
+// Number of plotted calls in the currently loaded session — the denominator
+// the zoom buttons clamp against, without re-deriving the whole point list.
+function detailCallCount() {
+  if (!detailData) return 0;
+  return detailData.events.filter((e) => e.kind === 'chat_completion' && e.timestamp).length;
+}
+
 // --- Stacked columns / area: context window over a session ------------------
 function renderSessionDetail(session, events) {
   detailData = { session, events };
-  for (const b of el('detail-modes').querySelectorAll('button')) {
+  for (const b of el('detail-modes').querySelectorAll('button[data-mode]')) {
     b.setAttribute('aria-pressed', String(b.dataset.mode === detailMode));
   }
   el('detail-title').textContent =
@@ -531,7 +579,7 @@ function renderSessionDetail(session, events) {
   // and drops hard at a compaction — and because the types are stacked rather
   // than summed into one line, you can also see the composition change there
   // (cache read collapses; cache write spikes as the summary is re-cached).
-  const points = calls.map((e, i) => {
+  const allPoints = calls.map((e, i) => {
     const parts = STACK.map((s) => e.usage[s.token] || 0);
     const costs = STACK.map((s) => (e.cost && e.cost[s.cost]) || 0);
     return {
@@ -544,6 +592,28 @@ function renderSessionDetail(session, events) {
       e,
     };
   });
+
+  // The zoom window is re-clamped against this session's length on every
+  // render, so a stale range from a longer session (or one invalidated by new
+  // calls streaming in) collapses to a valid one instead of drawing nothing.
+  detailZoom = clampZoom(detailZoom, allPoints.length);
+  const view = detailZoom || { start: 0, end: allPoints.length };
+  // Everything below works on the visible slice, so the bar/area choice,
+  // tooltips and markers all follow the zoom without special-casing it. Each
+  // point keeps its original index in `p.i` for labelling.
+  const points = allPoints.slice(view.start, view.end);
+
+  // Zoom controls reflect the clamped window, so the buttons grey out exactly
+  // when they'd be no-ops rather than on a guess about the range.
+  const zoomControls = el('detail-modes');
+  const atMin = view.end - view.start <= Math.min(MIN_ZOOM_CALLS, allPoints.length);
+  for (const b of zoomControls.querySelectorAll('button[data-zoom]')) {
+    const kind = b.dataset.zoom;
+    b.disabled = kind === 'in' ? atMin : !detailZoom;
+  }
+  el('detail-zoom-hint').textContent = detailZoom
+    ? `${fmtInt(view.end - view.start)} of ${fmtInt(allPoints.length)} calls`
+    : (allPoints.length > MIN_ZOOM_CALLS ? 'scroll to zoom' : '');
 
   // Two readings of the same stack:
   //
@@ -612,6 +682,9 @@ function renderSessionDetail(session, events) {
   // last call would pile up markers at the edges and imply drops that the
   // plotted data never shows. Anything out of range is reported in the legend
   // instead of being drawn in the wrong place.
+  // Bounded by the visible slice, so zooming in also narrows which compactions
+  // are drawn; the ones scrolled off are counted in the legend like any other
+  // out-of-range boundary.
   const firstCallTs = points[0].e.timestamp;
   const lastCallTs = points[points.length - 1].e.timestamp;
   const allCompactions = (session.compactions || []).map((c) => c.timestamp).filter(Boolean);
@@ -650,15 +723,15 @@ function renderSessionDetail(session, events) {
         const h = y(lower[i]) - yTop;
         if (h <= 0) return;
         svg.appendChild(svgEl('rect', {
-          x: x(p.i) - barW / 2, y: yTop, width: barW, height: h,
+          x: x(i) - barW / 2, y: yTop, width: barW, height: h,
           fill: s.color, 'fill-opacity': 0.85,
         }));
       });
     } else {
       // Forward along the top edge, back along the bottom edge.
-      const top = points.map((p, i) => `${i ? 'L' : 'M'}${x(p.i)},${y(upper[i])}`).join(' ');
+      const top = points.map((p, i) => `${i ? 'L' : 'M'}${x(i)},${y(upper[i])}`).join(' ');
       const bottom = points
-        .map((p, i) => `L${x(points[points.length - 1 - i].i)},${y(lower[points.length - 1 - i])}`)
+        .map((p, i) => `L${x(points.length - 1 - i)},${y(lower[points.length - 1 - i])}`)
         .join(' ');
 
       svg.appendChild(svgEl('path', {
@@ -674,7 +747,7 @@ function renderSessionDetail(session, events) {
   // the context window; in cost mode it is the per-call total spend. Columns
   // carry their own edges, so this is area mode only.
   if (!useBars) {
-    const outline = points.map((p, i) => `${i ? 'L' : 'M'}${x(p.i)},${y(lower[i])}`).join(' ');
+    const outline = points.map((p, i) => `${i ? 'L' : 'M'}${x(i)},${y(lower[i])}`).join(' ');
     svg.appendChild(svgEl('path', {
       d: outline, fill: 'none', stroke: 'var(--text-primary)',
       'stroke-width': 1, 'stroke-opacity': 0.35, 'stroke-linejoin': 'round',
@@ -703,7 +776,7 @@ function renderSessionDetail(session, events) {
         x: m.left + band * idx, y: m.top, width: band, height: plotH, fill: 'transparent',
       });
       hit.addEventListener('mousemove', (e) =>
-        showTip(e, `Call ${idx + 1} of ${points.length}`, tipRows(p, idx)));
+        showTip(e, `Call ${p.i + 1} of ${allPoints.length}`, tipRows(p, idx)));
       hit.addEventListener('mouseleave', hideTip);
       svg.appendChild(hit);
     });
@@ -716,7 +789,8 @@ function renderSessionDetail(session, events) {
       const rel = ((e.clientX - rect.left) / rect.width) * W;
       const ratio = (rel - m.left) / plotW;
       const idx = Math.max(0, Math.min(points.length - 1, Math.round(ratio * (points.length - 1))));
-      showTip(e, `Call ${idx + 1} of ${points.length}`, tipRows(points[idx], idx));
+      const p = points[idx];
+      showTip(e, `Call ${p.i + 1} of ${allPoints.length}`, tipRows(p, idx));
     });
     hit.addEventListener('mouseleave', hideTip);
     svg.appendChild(hit);
@@ -728,10 +802,93 @@ function renderSessionDetail(session, events) {
   const xlab = svgEl('text', {
     class: 'tick', x: m.left + plotW / 2, y: m.top + plotH + 20, 'text-anchor': 'middle',
   });
-  xlab.textContent = costMode
-    ? 'model calls, in order — band area is money'
-    : 'model calls, in order';
+  const zoomed = Boolean(detailZoom);
+  xlab.textContent =
+    (zoomed
+      ? `calls ${view.start + 1}–${view.end} of ${allPoints.length}`
+      : 'model calls, in order') +
+    (costMode ? ' — band area is money' : '');
   svg.appendChild(xlab);
+
+  // --- Zoom interactions ----------------------------------------------------
+  //
+  // Pointer position is converted to a fractional call index, so wheel-zoom
+  // keeps whatever is under the cursor pinned in place rather than always
+  // zooming to the middle.
+  const callAt = (clientX) => {
+    const rect = svg.getBoundingClientRect();
+    const rel = ((clientX - rect.left) / rect.width) * W;
+    const ratio = Math.max(0, Math.min(1, (rel - m.left) / plotW));
+    return view.start + ratio * (view.end - view.start);
+  };
+
+  const applyZoom = (next) => {
+    const clamped = clampZoom(next, allPoints.length);
+    const same = (!clamped && !detailZoom)
+      || (clamped && detailZoom
+          && clamped.start === detailZoom.start && clamped.end === detailZoom.end);
+    if (same) return;
+    detailZoom = clamped;
+    renderSessionDetail(session, events);
+  };
+
+  // passive:false so the page doesn't scroll while the cursor is over the plot.
+  svg.addEventListener('wheel', (e) => {
+    if (!e.deltaY) return;
+    e.preventDefault();
+    const anchor = callAt(e.clientX);
+    const span = view.end - view.start;
+    // Trackpads emit many small deltas and mice a few large ones; scaling by a
+    // capped magnitude keeps both feeling like the same gesture.
+    const step = Math.min(Math.abs(e.deltaY), 100) / 100;
+    const factor = e.deltaY > 0 ? 1 + 0.6 * step : 1 - 0.4 * step;
+    const nextSpan = span * factor;
+    if (nextSpan >= allPoints.length) return applyZoom(null);
+    // Keep `anchor` at the same fraction across the plot.
+    const frac = span > 0 ? (anchor - view.start) / span : 0.5;
+    applyZoom({ start: anchor - frac * nextSpan, end: anchor + (1 - frac) * nextSpan });
+  }, { passive: false });
+
+  // Drag to pan, but only while zoomed — otherwise there is nothing to pan to
+  // and the grab cursor would be a lie.
+  if (zoomed) {
+    svg.style.cursor = 'grab';
+    svg.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      hideTip();
+      // The listeners go on `window`, not the SVG: applyZoom re-renders and
+      // replaces this element, so anything bound to it would be detached after
+      // the first move and the drag would stall. Geometry is captured up front
+      // for the same reason — `rect` below belongs to the element that started
+      // the gesture, which stays valid because the replacement occupies the
+      // same box.
+      const rect = svg.getBoundingClientRect();
+      const base = { ...view };
+      const startCall = callAt(e.clientX);
+      host.style.cursor = 'grabbing';
+
+      const onMove = (ev) => {
+        // Measured against the window the drag *started* in, so the chart
+        // tracks the pointer 1:1 instead of accelerating as it shifts.
+        const rel = ((ev.clientX - rect.left) / rect.width) * W;
+        const ratio = Math.max(0, Math.min(1, (rel - m.left) / plotW));
+        const nowCall = base.start + ratio * (base.end - base.start);
+        const shift = startCall - nowCall;
+        if (Math.abs(shift) < 0.5) return;
+        applyZoom({ start: base.start + shift, end: base.end + shift });
+      };
+      const onUp = () => {
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        window.removeEventListener('pointercancel', onUp);
+        host.style.cursor = '';
+      };
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+      window.addEventListener('pointercancel', onUp);
+    });
+  }
 
   host.appendChild(svg);
 
@@ -750,7 +907,12 @@ function renderSessionDetail(session, events) {
       : '');
 
   // The table mirrors whichever mode is showing, so the chart's units and the
-  // table's units always agree.
+  // table's units always agree. It also follows the zoom — the last 40 calls
+  // *of the visible window* — so the label has to say which it is.
+  const shown = Math.min(40, points.length);
+  el('detail-table-label').textContent = detailZoom
+    ? `Table view — model calls (last ${shown} of ${fmtInt(points.length)} in view)`
+    : `Table view — model calls (last ${shown})`;
   el('detail-table').innerHTML =
     '<thead><tr><th class="num">#</th><th>Model</th>' +
     STACK.map((s) => `<th class="num">${s.label}</th>`).join('') +
@@ -776,6 +938,12 @@ let stats = null;
 let sessions = [];
 let selectedId = null;
 let detailMode = 'absolute'; // 'absolute' (tokens) | 'cost'
+// Horizontal zoom over the session chart, as a half-open index range into the
+// call list — not a pixel transform. Keeping it in call space means the
+// bar/area threshold, the tooltips and the compaction markers all keep working
+// on the visible slice without knowing zoom exists. null is "show everything",
+// which is also what a session switch resets to.
+let detailZoom = null; // { start, end } | null
 let detailData = null;       // last-rendered session payload, for re-render on toggle
 
 function renderTiles() {
@@ -844,6 +1012,10 @@ function renderSessions() {
 // `scroll` is opt-in: a user clicking a row wants to be taken to the chart,
 // but the auto-selection on load should leave the page where it is.
 async function selectSession(id, { scroll = true } = {}) {
+  // A window into the previous session means nothing here; start from the
+  // whole range. (A refresh of the *same* session deliberately keeps it, so a
+  // live SSE update doesn't yank the view out from under a zoomed-in user.)
+  if (id !== selectedId) detailZoom = null;
   selectedId = id;
   renderSessions();
   const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`);
@@ -955,10 +1127,31 @@ for (const panel of document.querySelectorAll('.panel')) {
 }
 
 el('detail-modes').addEventListener('click', (e) => {
-  const button = e.target.closest('button[data-mode]');
-  if (!button || button.dataset.mode === detailMode) return;
-  detailMode = button.dataset.mode;
-  if (detailData) renderSessionDetail(detailData.session, detailData.events);
+  const mode = e.target.closest('button[data-mode]');
+  if (mode) {
+    if (mode.dataset.mode === detailMode) return;
+    detailMode = mode.dataset.mode;
+    if (detailData) renderSessionDetail(detailData.session, detailData.events);
+    return;
+  }
+
+  const zoom = e.target.closest('button[data-zoom]');
+  if (!zoom || !detailData) return;
+  const n = detailCallCount();
+  if (!n) return;
+
+  // The buttons zoom around the middle of what's on screen — there is no
+  // cursor to anchor to, unlike the wheel.
+  const current = detailZoom || { start: 0, end: n };
+  const span = current.end - current.start;
+  const mid = (current.start + current.end) / 2;
+  const next =
+    zoom.dataset.zoom === 'reset' ? null
+      : zoom.dataset.zoom === 'in' ? { start: mid - span / 4, end: mid + span / 4 }
+        : { start: mid - span, end: mid + span };
+
+  detailZoom = clampZoom(next, n);
+  renderSessionDetail(detailData.session, detailData.events);
 });
 
 el('theme-toggle').addEventListener('click', () => {
