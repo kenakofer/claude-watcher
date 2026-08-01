@@ -21,6 +21,9 @@
     --series-2: #eb6834;  /* cache write  */
     --series-3: #1baf7a;  /* output       */
     --series-4: #eda100;  /* input        */
+    /* Cumulative-cost overlay. Deliberately outside the band palette so the
+       line never reads as a fifth token type. */
+    --cumulative: #7a4fd0;
     --good: #0ca30c;
     --critical: #d03b3b;
   }
@@ -39,6 +42,7 @@
       --series-2: #d95926;
       --series-3: #199e70;
       --series-4: #c98500;
+      --cumulative: #a687ea;
     }
   }
   :root[data-theme="dark"] {
@@ -55,6 +59,7 @@
     --series-2: #d95926;
     --series-3: #199e70;
     --series-4: #c98500;
+    --cumulative: #a687ea;
   }
 
   * { box-sizing: border-box; }
@@ -579,16 +584,23 @@ function renderSessionDetail(session, events) {
   // and drops hard at a compaction — and because the types are stacked rather
   // than summed into one line, you can also see the composition change there
   // (cache read collapses; cache write spikes as the summary is re-cached).
+  let running = 0;
   const allPoints = calls.map((e, i) => {
     const parts = STACK.map((s) => e.usage[s.token] || 0);
     const costs = STACK.map((s) => (e.cost && e.cost[s.cost]) || 0);
+    const costTotal = costs.reduce((a, b) => a + b, 0);
+    // Accumulated from the first call of the session, not the first visible
+    // one: "spent so far" is a property of the session, so zooming into a
+    // later window must not restart the total at zero.
+    running += costTotal;
     return {
       i,
       parts,
       costs,
       ctx: e.usage.inputTokens + e.usage.cacheReadTokens + e.usage.cacheCreationTokens,
       total: parts.reduce((a, b) => a + b, 0),
-      costTotal: costs.reduce((a, b) => a + b, 0),
+      costTotal,
+      cum: running,
       e,
     };
   });
@@ -629,7 +641,8 @@ function renderSessionDetail(session, events) {
 
   const W = Math.max(host.clientWidth || 720, 320);
   const H = 420;
-  const m = { top: 16, right: 16, bottom: 30, left: costMode ? 68 : 62 };
+  // Right margin holds the cumulative-cost axis labels.
+  const m = { top: 16, right: 56, bottom: 30, left: costMode ? 68 : 62 };
   const plotW = W - m.left - m.right;
   const plotH = H - m.top - m.bottom;
   // A single re-cache of a large context can cost 30x the median call, which
@@ -664,13 +677,46 @@ function renderSessionDetail(session, events) {
 
   const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, height: H });
 
+  // Cumulative cost rides on a second scale, drawn against the *same* gridlines
+  // as the left axis. Giving it its own nice-tick set would put a second family
+  // of horizontal lines at different heights and make the plot unreadable, so
+  // instead the visible cumulative range is mapped onto the existing tick
+  // fractions and each gridline gets a dollar label at the right.
+  //
+  // The scale spans the range covered by the visible calls, not [0, total]: the
+  // running total only climbs, so anchoring at zero would squash the whole
+  // visible segment into a sliver at the top whenever the window is late in a
+  // long session.
+  const cumLo = points[0].cum - points[0].costTotal;
+  const cumHi = points[points.length - 1].cum;
+  // Flat window (a zero-cost stretch) would divide by zero; give it a nominal
+  // span so the line sits on the baseline instead of vanishing.
+  const cumSpan = cumHi - cumLo || 1;
+  const cumY = (v) => m.top + plotH - ((v - cumLo) / cumSpan) * plotH;
+  // One precision for the whole axis, chosen from the span rather than from
+  // each value: fmtAxisUSD switches decimals by magnitude, which would print
+  // "$0.59" above "$1.2" in the same column. The step between labels is what
+  // has to stay distinguishable, so it sets the decimals.
+  const cumStep = cumSpan / (ticks.length - 1 || 1);
+  const cumDp = cumStep >= 1 ? 1 : cumStep >= 0.1 ? 2 : cumStep >= 0.01 ? 3 : 4;
+  const fmtCum = (v) => '$' + v.toFixed(cumDp);
+
   for (const t of ticks) {
+    const gy = y(t);
     svg.appendChild(svgEl('line', {
-      class: 'grid-line', x1: m.left, x2: m.left + plotW, y1: y(t), y2: y(t),
+      class: 'grid-line', x1: m.left, x2: m.left + plotW, y1: gy, y2: gy,
     }));
-    const label = svgEl('text', { class: 'tick', x: m.left - 8, y: y(t) + 4, 'text-anchor': 'end' });
+    const label = svgEl('text', { class: 'tick', x: m.left - 8, y: gy + 4, 'text-anchor': 'end' });
     label.textContent = costMode ? fmtAxisUSD(t) : compact(t);
     svg.appendChild(label);
+
+    // Same gridline, right-hand side: the cumulative value at that height.
+    const rightLabel = svgEl('text', {
+      class: 'tick', x: m.left + plotW + 8, y: gy + 4, 'text-anchor': 'start',
+      fill: 'var(--cumulative)',
+    });
+    rightLabel.textContent = fmtCum(cumLo + ((m.top + plotH - gy) / plotH) * cumSpan);
+    svg.appendChild(rightLabel);
   }
 
   // Compaction markers: the transcript reports these explicitly, so they are
@@ -754,6 +800,20 @@ function renderSessionDetail(session, events) {
     }));
   }
 
+  // Cumulative cost, overlaid on its own scale. Drawn after the bands so it
+  // stays legible over them, and before the hit targets so hovering still
+  // reaches the tooltip rects rather than landing on the line.
+  //
+  // In bar mode the points sit at band centres like the columns; in area mode
+  // they span edge to edge, matching x() either way.
+  const cumPath = points
+    .map((p, i) => `${i ? 'L' : 'M'}${x(i)},${cumY(p.cum)}`)
+    .join(' ');
+  svg.appendChild(svgEl('path', {
+    d: cumPath, fill: 'none', stroke: 'var(--cumulative)',
+    'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+  }));
+
   const tipRows = (p, idx) => [
     // Bands top-down, so the tooltip order matches what the eye sees.
     ...STACK.map((s, si) => [
@@ -765,6 +825,7 @@ function renderSessionDetail(session, events) {
     costMode
       ? ['Call cost', fmtExactUSD(p.costTotal) + (p.costTotal > costCeiling ? ' (clipped)' : '')]
       : ['Context window', fmtInt(p.ctx) + ' tok'],
+    ['Spent so far', fmtExactUSD(p.cum)],
     ['Model', p.e.modelLabel || '—'],
   ];
 
@@ -896,6 +957,8 @@ function renderSessionDetail(session, events) {
     STACK.slice().reverse().map(
       (s) => `<span class="item"><span class="swatch" style="background:${s.color}"></span>${s.label}</span>`,
     ).join('') +
+    `<span class="item"><span class="swatch" style="background:var(--cumulative)"></span>` +
+    `Spent so far — right axis (${fmtExactUSD(cumHi)})</span>` +
     (inRange.length
       ? `<span class="item"><span class="swatch" style="background:var(--critical)"></span>Compaction (${inRange.length})</span>`
       : '') +
