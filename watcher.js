@@ -188,10 +188,28 @@ function normalize(entry, context) {
       const usage = message.usage || {};
       const out = [];
 
+      // Claude Code writes one transcript row per content block, not per API
+      // call: a turn that emits text plus two tool_use blocks lands as three
+      // assistant entries sharing a message.id, a requestId, and a verbatim
+      // copy of the same usage object. Counting each row as a call would
+      // multiply both tokens and cost by the block count (~1.8x in practice),
+      // so only the first row of a message becomes a chat_completion. The
+      // tool_call loop below still runs for every row — those blocks are
+      // genuinely one per row, and each is a distinct tool invocation.
+      //
+      // Keyed on message.id, falling back to requestId. When a row carries
+      // neither there is nothing to correlate siblings by, so it is counted:
+      // over-counting an unidentifiable call is better than dropping a real
+      // one, and such rows have no siblings to collapse anyway.
+      const dedupeKey = message.id || entry.requestId || null;
+      const seen = context.seenMessages;
+      const duplicate = Boolean(dedupeKey && seen && seen.has(dedupeKey));
+      if (dedupeKey && seen) seen.add(dedupeKey);
+
       // Synthetic messages are local placeholders (e.g. interrupts), not
       // billable model calls.
       const model = message.model;
-      if (model && model !== '<synthetic>') {
+      if (model && model !== '<synthetic>' && !duplicate) {
         out.push({
           ...base,
           kind: 'chat_completion',
@@ -401,9 +419,13 @@ async function readNew(filePath, state) {
   }
   if (stat.size === state.offset) return [];
   if (stat.size < state.offset) {
-    // File shrank — treat as a fresh file rather than reading garbage.
+    // File shrank — treat as a fresh file rather than reading garbage. The
+    // seen-message set is part of that reset: its ids describe content that is
+    // no longer in the file, and keeping them would suppress calls in the
+    // replacement transcript that happened to reuse an id.
     state.offset = 0;
     state.partial = '';
+    state.context.seenMessages?.clear();
   }
 
   const handle = await fsp.open(filePath, 'r');
@@ -482,6 +504,12 @@ async function contextForFile(descriptor) {
     project: descriptor.project,
     isSidechain: descriptor.isSidechain,
     parentSessionId: descriptor.parentSessionId || null,
+    // Message ids already counted as calls in this file. It lives on the
+    // per-file context (which outlives a single poll) rather than inside
+    // ingest(), because a message's sibling rows are frequently split across
+    // reads — the tail catches the text block on one pass and its tool_use
+    // rows on the next.
+    seenMessages: new Set(),
   };
   if (!descriptor.isSidechain) return context;
 
