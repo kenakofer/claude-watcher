@@ -24,6 +24,9 @@
     /* Cumulative-cost overlay. Deliberately outside the band palette so the
        line never reads as a fifth token type. */
     --cumulative: #7a4fd0;
+    /* Money grid overlay. Near-neutral on purpose: it sits on top of the data,
+       so any real hue would read as another series. */
+    --money-grid: #0b0b0b;
     --good: #0ca30c;
     --critical: #d03b3b;
   }
@@ -43,6 +46,7 @@
       --series-3: #199e70;
       --series-4: #c98500;
       --cumulative: #a687ea;
+      --money-grid: #ffffff;
     }
   }
   :root[data-theme="dark"] {
@@ -60,6 +64,7 @@
     --series-3: #199e70;
     --series-4: #c98500;
     --cumulative: #a687ea;
+    --money-grid: #ffffff;
   }
 
   * { box-sizing: border-box; }
@@ -800,6 +805,150 @@ function renderSessionDetail(session, events) {
     }));
   }
 
+  // --- Money grid -----------------------------------------------------------
+  //
+  // Cost mode already means "band area is money": the y axis is dollars per
+  // call and the x axis is calls, so a region's width x height carries units of
+  // dollars. That makes a grid cell a *quantity of money*, and counting cells
+  // under the stack estimates the spend directly. This draws that unit.
+  //
+  // Cells are square in pixels, so the eye can count them without mentally
+  // correcting for a stretched aspect. Solving side^2 = cell$ x px-per-call x
+  // px-per-dollar gives the side for a given cell value.
+  //
+  // The cell value is not pinned to exactly $1. A literal $1 cell measures
+  // anywhere from 11px to 355px across the real sessions here — unreadable
+  // noise at one end, two cells on the whole plot at the other. Instead the
+  // value steps in powers of ten to land the side near TARGET px; $1 is simply
+  // what it picks when the data is in the range where $1 is legible. The chosen
+  // value is stated in the legend, so the unit is never ambiguous.
+  //
+  // Powers of ten only, rather than a finer 1-2-5 ladder: a decade step keeps
+  // the label a plain "$1" or "$10" instead of "$0.05" or "$50", and mental
+  // arithmetic over the squares stays trivial. The cost is a wider spread in
+  // cell size (27-71px across these sessions, against 36-50px for 1-2-5),
+  // which is well inside the legible range.
+  let moneyGrid = null;
+  if (costMode) {
+    const MONEY_GRID_TARGET_PX = 42;
+    const pxPerCall = plotW / points.length;
+    const pxPerDollar = plotH / top;
+    for (let e = -4; e <= 4; e += 1) {
+      const value = 10 ** e;
+      const side = Math.sqrt(value * pxPerCall * pxPerDollar);
+      const score = Math.abs(Math.log(side / MONEY_GRID_TARGET_PX));
+      if (!moneyGrid || score < moneyGrid.score) moneyGrid = { value, side, score };
+    }
+  }
+
+  if (moneyGrid && Number.isFinite(moneyGrid.side) && moneyGrid.side > 4) {
+    const side = moneyGrid.side;
+    const defs = svgEl('defs');
+    // Unique per render: several charts can share the document, and a repeated
+    // id would make them all resolve to whichever defs block came first.
+    const uid = `mg${Math.random().toString(36).slice(2, 9)}`;
+
+    // Lines are anchored to the axes (bottom-left), not the top-left, so a cell
+    // boundary always sits on $0 and on the first call. Otherwise the grid
+    // would float against the very axes it is supposed to be measuring.
+    const pattern = svgEl('pattern', {
+      id: `${uid}-p`, width: side, height: side,
+      patternUnits: 'userSpaceOnUse',
+      // Offset so the pattern's own origin lands on the plot's bottom-left.
+      x: m.left, y: m.top + plotH - Math.ceil(plotH / side) * side,
+    });
+    pattern.appendChild(svgEl('path', {
+      d: `M0,0 H${side} M0,0 V${side}`,
+      fill: 'none', stroke: 'var(--money-grid)', 'stroke-width': 1,
+    }));
+    defs.appendChild(pattern);
+
+    // The reveal. A radial gradient drives a luminance mask: white shows the
+    // grid, black hides it. The halo is the white core following the cursor;
+    // the edge frame is a separate always-on band so the grid is discoverable
+    // before the mouse ever enters the plot, and so it reads as a real chart
+    // element rather than a hover gimmick.
+    const grad = svgEl('radialGradient', {
+      id: `${uid}-g`, gradientUnits: 'userSpaceOnUse',
+      // Parked off-canvas until the first mousemove, so no halo is visible
+      // until the pointer actually arrives.
+      cx: -9999, cy: -9999, r: side * 3.2,
+    });
+    // Fades to nothing well before the radius, so there is no hard rim.
+    for (const [offset, opacity] of [[0, 1], [0.45, 0.75], [0.75, 0.25], [1, 0]]) {
+      grad.appendChild(svgEl('stop', {
+        offset, 'stop-color': '#fff', 'stop-opacity': opacity,
+      }));
+    }
+    defs.appendChild(grad);
+
+    const mask = svgEl('mask', { id: `${uid}-m`, maskUnits: 'userSpaceOnUse',
+      x: m.left, y: m.top, width: plotW, height: plotH,
+      // Isolate so the screened layers below blend against this mask's own
+      // backdrop and not whatever happens to sit behind the chart.
+      style: 'isolation:isolate' });
+    // Opaque black base: `screen` needs something to brighten against, and a
+    // mask with no base is transparent, which composites unpredictably.
+    mask.appendChild(svgEl('rect', {
+      x: m.left, y: m.top, width: plotW, height: plotH, fill: '#000',
+    }));
+    // Edge frame: brightest at the plot border, gone by `fade` inward. Built
+    // from four linear gradients rather than one inset shape so the corners sum
+    // smoothly instead of showing a mitre seam.
+    const fade = Math.min(side * 1.6, plotW / 2, plotH / 2);
+    const edges = [
+      ['x1', m.left, 'y1', m.top, 'x2', m.left + fade, 'y2', m.top],
+      ['x1', m.left + plotW, 'y1', m.top, 'x2', m.left + plotW - fade, 'y2', m.top],
+      ['x1', m.left, 'y1', m.top, 'x2', m.left, 'y2', m.top + fade],
+      ['x1', m.left, 'y1', m.top + plotH, 'x2', m.left, 'y2', m.top + plotH - fade],
+    ];
+    edges.forEach((coords, gi) => {
+      const eg = svgEl('linearGradient', { id: `${uid}-e${gi}`, gradientUnits: 'userSpaceOnUse' });
+      for (let ci = 0; ci < coords.length; ci += 2) eg.setAttribute(coords[ci], coords[ci + 1]);
+      eg.appendChild(svgEl('stop', { offset: 0, 'stop-color': '#fff', 'stop-opacity': 0.55 }));
+      eg.appendChild(svgEl('stop', { offset: 1, 'stop-color': '#fff', 'stop-opacity': 0 }));
+      defs.appendChild(eg);
+      mask.appendChild(svgEl('rect', {
+        x: m.left, y: m.top, width: plotW, height: plotH, fill: `url(#${uid}-e${gi})`,
+        // Layers inside a mask composite normally, so each rect would paint
+        // over the last and only the final one would survive. `screen` takes
+        // the brighter of the two instead, letting the four edges and the halo
+        // build one combined reveal rather than erasing each other.
+        style: 'mix-blend-mode:screen',
+      }));
+    });
+    // The halo itself, over the frame and screened against it for the same
+    // reason, so it brightens the edges where the two overlap.
+    const haloRect = svgEl('rect', {
+      x: m.left, y: m.top, width: plotW, height: plotH, fill: `url(#${uid}-g)`,
+      style: 'mix-blend-mode:screen',
+    });
+    mask.appendChild(haloRect);
+    defs.appendChild(mask);
+    svg.appendChild(defs);
+
+    svg.appendChild(svgEl('rect', {
+      x: m.left, y: m.top, width: plotW, height: plotH,
+      fill: `url(#${uid}-p)`, mask: `url(#${uid}-m)`,
+      'fill-opacity': 0.45, 'pointer-events': 'none',
+    }));
+
+    // Move the halo by mutating the gradient centre only — no re-render, so
+    // this stays cheap on the 9000-call sessions. Bound to the SVG rather than
+    // the hit rects because those are added per band and would miss the gaps.
+    svg.addEventListener('mousemove', (ev) => {
+      const rect = svg.getBoundingClientRect();
+      if (!rect.width) return;
+      // Client px -> viewBox units, since the SVG scales to its container.
+      grad.setAttribute('cx', ((ev.clientX - rect.left) / rect.width) * W);
+      grad.setAttribute('cy', ((ev.clientY - rect.top) / rect.height) * H);
+    });
+    svg.addEventListener('mouseleave', () => {
+      grad.setAttribute('cx', -9999);
+      grad.setAttribute('cy', -9999);
+    });
+  }
+
   // Cumulative cost, overlaid on its own scale. Drawn after the bands so it
   // stays legible over them, and before the hit targets so hovering still
   // reaches the tooltip rects rather than landing on the line.
@@ -959,6 +1108,21 @@ function renderSessionDetail(session, events) {
     ).join('') +
     `<span class="item"><span class="swatch" style="background:var(--cumulative)"></span>` +
     `Spent so far — right axis (${fmtExactUSD(cumHi)})</span>` +
+    // Two things this line has to get right:
+    //
+    //  - Bar mode draws columns at 70% of their band, so the *ink* is 70% of
+    //    the area it represents; only the gapless area mode can be counted
+    //    directly. Say which reading applies rather than letting a naive count
+    //    run ~30% low.
+    //  - The value is always an exact power of ten, so print just enough
+    //    decimals to show it and no more: fmtAxisUSD would render these as
+    //    "$1.0" and "$0.0010", trailing digits implying a precision the value
+    //    doesn't have.
+    (moneyGrid
+      ? `<span class="item muted">Grid square = ` +
+        `$${moneyGrid.value.toFixed(Math.max(0, -Math.round(Math.log10(moneyGrid.value))))} of spend` +
+        `${useBars ? ' (per column band, not the drawn bar width)' : ' — count squares under the curve'}</span>`
+      : '') +
     (inRange.length
       ? `<span class="item"><span class="swatch" style="background:var(--critical)"></span>Compaction (${inRange.length})</span>`
       : '') +
