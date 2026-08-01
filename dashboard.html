@@ -493,7 +493,13 @@ function renderBars(hostId, tableId, rows, opts) {
   el(tableId).innerHTML = opts.table(rows);
 }
 
-// --- Line chart: context window over a session ------------------------------
+// Below this many calls, the session breakdown is drawn as discrete stacked
+// columns: each call is a real event, and at this density a bar per call is
+// both readable and honest about that. Above it the bars are thinner than
+// their own gaps, so the stacked area reads better as a trend.
+const BAR_MODE_MAX_CALLS = 400;
+
+// --- Stacked columns / area: context window over a session ------------------
 function renderSessionDetail(session, events) {
   detailData = { session, events };
   for (const b of el('detail-modes').querySelectorAll('button')) {
@@ -574,7 +580,14 @@ function renderSessionDetail(session, events) {
   const max = costMode ? costCeiling : Math.max(...points.map((p) => p.total), 1);
   const ticks = niceTicks(max * 1.06, 5, true);
   const top = ticks[ticks.length - 1];
-  const x = (i) => m.left + (points.length === 1 ? plotW / 2 : (i / (points.length - 1)) * plotW);
+  // Bars sit in evenly divided bands; the area path spans edge to edge so the
+  // trend reaches both sides of the plot.
+  const useBars = points.length < BAR_MODE_MAX_CALLS;
+  const band = plotW / points.length;
+  const barW = Math.max(1, Math.min(24, band * 0.7));
+  const x = useBars
+    ? (i) => m.left + band * (i + 0.5)
+    : (i) => m.left + (points.length === 1 ? plotW / 2 : (i / (points.length - 1)) * plotW);
   // Clamped so a clipped cost band stops at the plot ceiling instead of
   // drawing outside the chart area.
   const y = (v) => m.top + plotH - (Math.min(v, top) / top) * plotH;
@@ -609,70 +622,105 @@ function renderSessionDetail(session, events) {
   for (const ts of inRange) {
     const idx = points.findIndex((p) => p.e.timestamp && p.e.timestamp >= ts);
     if (idx < 0) continue;
+    // The boundary falls between the previous call and this one, so in bar
+    // mode draw it at the leading edge of the band rather than through the
+    // middle of a column it didn't split.
+    const mx = useBars ? m.left + band * idx : x(idx);
     svg.appendChild(svgEl('line', {
-      x1: x(idx), x2: x(idx), y1: m.top, y2: m.top + plotH,
+      x1: mx, x2: mx, y1: m.top, y2: m.top + plotH,
       stroke: 'var(--critical)', 'stroke-width': 1,
     }));
   }
   const outOfRange = allCompactions.length - inRange.length;
 
-  // Stacked areas, drawn bottom band first. Each band is the region between
+  // Stacked bands, drawn bottom band first. Each band is the region between
   // the running total below it and the running total including it, so the
-  // outline of the whole stack is the context window.
+  // height of the whole stack is the context window.
   const lower = new Array(points.length).fill(0);
   STACK.forEach((s, si) => {
     const upper = points.map((p, i) => lower[i] + (costMode ? p.costs[si] : p.parts[si]));
 
-    // Forward along the top edge, back along the bottom edge.
-    const top = points.map((p, i) => `${i ? 'L' : 'M'}${x(p.i)},${y(upper[i])}`).join(' ');
-    const bottom = points
-      .map((p, i) => `L${x(points[points.length - 1 - i].i)},${y(lower[points.length - 1 - i])}`)
-      .join(' ');
+    if (useBars) {
+      // One rect per call. No inter-segment gap here (unlike the daily chart):
+      // with cache read at ~99% of a token-mode stack, the thin bands are only
+      // a pixel or two tall and a gap would erase them entirely.
+      points.forEach((p, i) => {
+        if (upper[i] <= lower[i]) return;
+        const yTop = y(upper[i]);
+        const h = y(lower[i]) - yTop;
+        if (h <= 0) return;
+        svg.appendChild(svgEl('rect', {
+          x: x(p.i) - barW / 2, y: yTop, width: barW, height: h,
+          fill: s.color, 'fill-opacity': 0.85,
+        }));
+      });
+    } else {
+      // Forward along the top edge, back along the bottom edge.
+      const top = points.map((p, i) => `${i ? 'L' : 'M'}${x(p.i)},${y(upper[i])}`).join(' ');
+      const bottom = points
+        .map((p, i) => `L${x(points[points.length - 1 - i].i)},${y(lower[points.length - 1 - i])}`)
+        .join(' ');
 
-    svg.appendChild(svgEl('path', {
-      d: `${top} ${bottom} Z`, fill: s.color, 'fill-opacity': 0.85, stroke: 'none',
-    }));
+      svg.appendChild(svgEl('path', {
+        d: `${top} ${bottom} Z`, fill: s.color, 'fill-opacity': 0.85, stroke: 'none',
+      }));
+    }
 
     for (let i = 0; i < points.length; i += 1) lower[i] = upper[i];
   });
 
   // A thin line on the stack's top edge keeps the outline legible where the
   // topmost bands are only a few pixels tall. In token mode that outline is
-  // the context window; in cost mode it is the per-call total spend.
-  const outline = points.map((p, i) => `${i ? 'L' : 'M'}${x(p.i)},${y(lower[i])}`).join(' ');
-  svg.appendChild(svgEl('path', {
-    d: outline, fill: 'none', stroke: 'var(--text-primary)',
-    'stroke-width': 1, 'stroke-opacity': 0.35, 'stroke-linejoin': 'round',
-  }));
+  // the context window; in cost mode it is the per-call total spend. Columns
+  // carry their own edges, so this is area mode only.
+  if (!useBars) {
+    const outline = points.map((p, i) => `${i ? 'L' : 'M'}${x(p.i)},${y(lower[i])}`).join(' ');
+    svg.appendChild(svgEl('path', {
+      d: outline, fill: 'none', stroke: 'var(--text-primary)',
+      'stroke-width': 1, 'stroke-opacity': 0.35, 'stroke-linejoin': 'round',
+    }));
+  }
 
-  const hit = svgEl('rect', {
-    x: m.left, y: m.top, width: plotW, height: plotH, fill: 'transparent',
-  });
-  hit.addEventListener('mousemove', (e) => {
-    const rect = svg.getBoundingClientRect();
-    const rel = ((e.clientX - rect.left) / rect.width) * W;
-    const ratio = (rel - m.left) / plotW;
-    const idx = Math.max(0, Math.min(points.length - 1, Math.round(ratio * (points.length - 1))));
-    const p = points[idx];
-    showTip(e, `Call ${idx + 1} of ${points.length}`, [
-      // Bands top-down, so the tooltip order matches what the eye sees.
-      ...STACK.map((s, si) => [
-        s.label,
-        costMode
-          ? `${fmtExactUSD(p.costs[si])} · ${compact(p.parts[si])} tok`
-          : fmtInt(p.parts[si]) + ' tok',
-      ]).reverse(),
+  const tipRows = (p, idx) => [
+    // Bands top-down, so the tooltip order matches what the eye sees.
+    ...STACK.map((s, si) => [
+      s.label,
       costMode
-        ? [
-            'Call cost',
-            fmtExactUSD(p.costTotal) + (p.costTotal > costCeiling ? ' (clipped)' : ''),
-          ]
-        : ['Context window', fmtInt(p.ctx) + ' tok'],
-      ['Model', p.e.modelLabel || '—'],
-    ]);
-  });
-  hit.addEventListener('mouseleave', hideTip);
-  svg.appendChild(hit);
+        ? `${fmtExactUSD(p.costs[si])} · ${compact(p.parts[si])} tok`
+        : fmtInt(p.parts[si]) + ' tok',
+    ]).reverse(),
+    costMode
+      ? ['Call cost', fmtExactUSD(p.costTotal) + (p.costTotal > costCeiling ? ' (clipped)' : '')]
+      : ['Context window', fmtInt(p.ctx) + ' tok'],
+    ['Model', p.e.modelLabel || '—'],
+  ];
+
+  if (useBars) {
+    // A hit target per band, so hovering a column never demands pixel
+    // precision against the gap next to it.
+    points.forEach((p, idx) => {
+      const hit = svgEl('rect', {
+        x: m.left + band * idx, y: m.top, width: band, height: plotH, fill: 'transparent',
+      });
+      hit.addEventListener('mousemove', (e) =>
+        showTip(e, `Call ${idx + 1} of ${points.length}`, tipRows(p, idx)));
+      hit.addEventListener('mouseleave', hideTip);
+      svg.appendChild(hit);
+    });
+  } else {
+    const hit = svgEl('rect', {
+      x: m.left, y: m.top, width: plotW, height: plotH, fill: 'transparent',
+    });
+    hit.addEventListener('mousemove', (e) => {
+      const rect = svg.getBoundingClientRect();
+      const rel = ((e.clientX - rect.left) / rect.width) * W;
+      const ratio = (rel - m.left) / plotW;
+      const idx = Math.max(0, Math.min(points.length - 1, Math.round(ratio * (points.length - 1))));
+      showTip(e, `Call ${idx + 1} of ${points.length}`, tipRows(points[idx], idx));
+    });
+    hit.addEventListener('mouseleave', hideTip);
+    svg.appendChild(hit);
+  }
 
   svg.appendChild(svgEl('line', {
     class: 'axis-line', x1: m.left, x2: m.left + plotW, y1: m.top + plotH, y2: m.top + plotH,
