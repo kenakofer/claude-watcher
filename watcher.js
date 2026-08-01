@@ -97,6 +97,11 @@ function emptySession(sessionId, meta = {}) {
       outputTokens: 0,
       cacheReadTokens: 0,
       cacheCreationTokens: 0,
+      // Cache writes split by TTL. Billed at different rates (1.25x input for
+      // 5m, 2x for 1h), and the mix is a property of how the session was
+      // launched — FORCE_PROMPT_CACHING_5M forces the short TTL throughout.
+      cacheCreation1h: 0,
+      cacheCreation5m: 0,
       calls: 0,
       prompts: 0,
       toolCalls: 0,
@@ -148,6 +153,27 @@ function textFromContent(content) {
     .filter((block) => block && block.type === 'text' && typeof block.text === 'string')
     .map((block) => block.text)
     .join('\n');
+}
+
+/**
+ * Split a usage block's cache-creation tokens by TTL.
+ *
+ * Kept in lockstep with the fallback in `costOf`: when neither ephemeral field
+ * is present the flat `cache_creation_input_tokens` is billed at the 1h rate,
+ * so it is attributed to 1h here as well. Otherwise the classification and the
+ * cost would disagree — a session would show as "no cache writes by TTL" while
+ * still being charged for them.
+ */
+function splitCacheCreation(usage) {
+  const creation = usage.cache_creation || {};
+  const has1h = creation.ephemeral_1h_input_tokens != null;
+  const has5m = creation.ephemeral_5m_input_tokens != null;
+  return {
+    cacheCreation1h: has1h || has5m
+      ? creation.ephemeral_1h_input_tokens || 0
+      : usage.cache_creation_input_tokens || 0,
+    cacheCreation5m: creation.ephemeral_5m_input_tokens || 0,
+  };
 }
 
 /**
@@ -226,8 +252,10 @@ function normalize(entry, context) {
             outputTokens: usage.output_tokens || 0,
             cacheReadTokens: usage.cache_read_input_tokens || 0,
             cacheCreationTokens: usage.cache_creation_input_tokens || 0,
-            cacheCreation1h: usage.cache_creation?.ephemeral_1h_input_tokens || 0,
-            cacheCreation5m: usage.cache_creation?.ephemeral_5m_input_tokens || 0,
+            // Mirror the fallback in `costOf`: when the TTL split is absent
+            // entirely, the flat count is billed as 1h, so attribute it to 1h
+            // here too rather than reporting 0/0 and losing the tokens.
+            ...splitCacheCreation(usage),
           },
           cost: costOf(usage, model, entry.timestamp, usage.speed),
         });
@@ -315,6 +343,8 @@ function applyToSession(event) {
       t.outputTokens += u.outputTokens;
       t.cacheReadTokens += u.cacheReadTokens;
       t.cacheCreationTokens += u.cacheCreationTokens;
+      t.cacheCreation1h += u.cacheCreation1h;
+      t.cacheCreation5m += u.cacheCreation5m;
       t.cost += event.cost.total;
       t.costInput += event.cost.input;
       t.costOutput += event.cost.output;
@@ -583,6 +613,8 @@ function stats() {
     outputTokens: 0,
     cacheReadTokens: 0,
     cacheCreationTokens: 0,
+    cacheCreation1h: 0,
+    cacheCreation5m: 0,
     cost: 0,
     costInput: 0,
     costOutput: 0,
@@ -610,6 +642,8 @@ function stats() {
     totals.outputTokens += u.outputTokens;
     totals.cacheReadTokens += u.cacheReadTokens;
     totals.cacheCreationTokens += u.cacheCreationTokens;
+    totals.cacheCreation1h += u.cacheCreation1h;
+    totals.cacheCreation5m += u.cacheCreation5m;
     totals.cost += event.cost.total;
     totals.costInput += event.cost.input;
     totals.costOutput += event.cost.output;

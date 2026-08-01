@@ -49,6 +49,21 @@ absent.
 Cache reads dominate total spend — typically ~65–85%. If a change makes the
 cache lines look small, that is the bug, not the data.
 
+The TTL split is also surfaced per session: `splitCacheCreation` in
+`watcher.js` mirrors the `costOf` fallback (a flat `cache_creation_input_tokens`
+with no ephemeral fields is attributed to 1h, because that is how it is billed),
+and `cacheTtl` in `dashboard.html` turns the session totals into a **Cache TTL**
+column. Keep those two fallbacks in lockstep — if they diverge, a session shows
+"no cache writes by TTL" while still being charged for them.
+
+`FORCE_PROMPT_CACHING_5M=1` forces the short TTL for a whole session. That
+setting is never written to the transcript, so the billing split is the only
+evidence of it. The column reports a *share*, not a verdict: a resumed session
+legitimately carries both TTLs (pre-resume calls keep what they were written
+under), so `mixed` is a real state rather than an error — in practice a
+sizeable minority of sessions land there. The 1h/5m thresholds are 99%/1%
+rather than exact equality so a few stray tokens don't demote a clean session.
+
 ## Adding a model
 
 Add an entry to `MODELS` in `pricing.js` keyed by the bare model id (no date

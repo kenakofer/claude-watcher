@@ -173,6 +173,16 @@
     display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px;
     border: 1px solid var(--border); color: var(--text-secondary);
   }
+  /* TTL pills reuse the cache-write series hue — the thing they describe — so
+     a reader who has learned that color on the charts sees the same meaning
+     here. 1h is the default and stays unaccented to keep the column quiet;
+     only the non-default states earn ink. */
+  .pill.ttl-1h { color: var(--muted); }
+  .pill.ttl-5m,
+  .pill.ttl-mixed {
+    color: var(--series-2); border-color: var(--series-2);
+  }
+  .pill.ttl-mixed { border-style: dashed; }
   .muted { color: var(--muted); }
   details { margin-top: 12px; }
   summary { font-size: 12px; color: var(--text-secondary); cursor: pointer; }
@@ -325,6 +335,35 @@ const STACK = [
   { token: 'inputTokens',         cost: 'input',      label: 'Input',       color: 'var(--series-4)' },
   { token: 'outputTokens',        cost: 'output',     label: 'Output',      color: 'var(--series-3)' },
 ];
+
+// Classify a session by the TTL of its cache writes.
+//
+// Claude Code writes 1h-TTL cache entries by default; FORCE_PROMPT_CACHING_5M=1
+// forces the short TTL for the whole session. That choice is never recorded in
+// the transcript as a setting, but it is fully visible in the billing split, so
+// the mix is the only available evidence of how a session was launched.
+//
+// Deliberately reported as a share rather than a verdict: a resumed session can
+// legitimately carry both (the pre-resume calls keep whatever TTL they were
+// written under), so a hard "this session was 5m" label would be wrong for the
+// mixed case. `mixed` is a real state, not an error.
+function cacheTtl(totals) {
+  const h1 = totals.cacheCreation1h || 0;
+  const m5 = totals.cacheCreation5m || 0;
+  const total = h1 + m5;
+  if (!total) return { kind: 'none', label: '—', title: 'No cache writes recorded.' };
+  const share5m = m5 / total;
+  const pct = (x) => (x * 100).toFixed(x > 0 && x < 0.01 ? 1 : 0) + '%';
+  const detail =
+    `${compact(m5)} tok at 5m (${pct(share5m)}), ` +
+    `${compact(h1)} tok at 1h (${pct(1 - share5m)}). ` +
+    'Cache writes bill at 1.25x input for 5m, 2x for 1h.';
+  // Thresholds, not equality: a handful of stray tokens from the other TTL
+  // shouldn't demote an otherwise clean session to "mixed".
+  if (share5m >= 0.99) return { kind: '5m', label: '5m', title: `Short TTL throughout. ${detail}` };
+  if (share5m <= 0.01) return { kind: '1h', label: '1h', title: `Default 1h TTL. ${detail}` };
+  return { kind: 'mixed', label: `mixed ${pct(share5m)}`, title: `Both TTLs present. ${detail}` };
+}
 
 const el = (id) => document.getElementById(id);
 const tip = el('tip');
@@ -566,9 +605,11 @@ function renderSessionDetail(session, events) {
   el('detail-title').textContent =
     `Session breakdown: ${session.title || session.sessionId.slice(0, 8)}`;
   const started = session.firstTimestamp ? new Date(session.firstTimestamp).toLocaleString() : '—';
+  const ttl = cacheTtl(session.totals);
+  const ttlNote = ttl.kind === 'none' ? '' : ` · ${ttl.label} cache TTL`;
   el('detail-sub').textContent =
     `${session.project || 'unknown project'} · started ${started} · ` +
-    `${fmtInt(session.totals.calls)} calls · ${fmtUSD(session.totals.cost)} — ` +
+    `${fmtInt(session.totals.calls)} calls · ${fmtUSD(session.totals.cost)}${ttlNote} — ` +
     (detailMode === 'cost'
       ? 'cost per turn, stacked; band area is money at list API rates.'
       : 'tokens per turn, stacked; the stack height is the context window.');
@@ -1211,7 +1252,8 @@ function renderSessions() {
   const rows = sessions.slice(0, 60);
   el('sessions-table').innerHTML =
     '<thead><tr><th>Session</th><th>Project</th><th class="num">Calls</th>' +
-    '<th class="num">Context</th><th class="num">Cost</th><th>Last active</th></tr></thead><tbody>' +
+    '<th class="num">Context</th><th class="num">Cost</th><th>Cache TTL</th>' +
+    '<th>Last active</th></tr></thead><tbody>' +
     rows.map((s) => {
       const name = s.title || s.sessionId.slice(0, 8);
       const when = s.lastTimestamp ? new Date(s.lastTimestamp).toLocaleString() : '—';
@@ -1219,12 +1261,17 @@ function renderSessions() {
       const badge = s.isSidechain
         ? `<span class="pill">${s.agentType || 'subagent'}</span> `
         : '';
+      const ttl = cacheTtl(s.totals);
+      const ttlCell = ttl.kind === 'none'
+        ? '<span class="muted">—</span>'
+        : `<span class="pill ttl-${ttl.kind}">${ttl.label}</span>`;
       return `<tr data-id="${encodeURIComponent(s.sessionId)}" ${s.sessionId === selectedId ? 'class="selected"' : ''}>
         <td class="name">${badge}${name}</td>
         <td class="name muted">${project}</td>
         <td class="num">${fmtInt(s.totals.calls)}</td>
         <td class="num">${s.contextWindow ? compact(s.contextWindow) : '—'}</td>
         <td class="num">${fmtUSD(s.totals.cost)}</td>
+        <td title="${ttl.title}">${ttlCell}</td>
         <td class="muted">${when}</td>
       </tr>`;
     }).join('') +
