@@ -150,5 +150,19 @@ stacked chart reads those keys, and their absence renders empty bars); and a
 session with compactions should draw markers that land on visible drops in the
 context line.
 
+`/api/sessions/<id>` returns `{ session, events }` — the compaction list is at
+`session.compactions`, not at the top level. Reading it from the wrong level
+yields an empty array rather than an error, which silently makes every
+compaction-dependent behaviour look like a no-op. If a check involving
+compactions reports zero across every session, suspect the harness before the
+feature: `/api/stats` `.totals.compactions` is the independent cross-check.
+
+Cache-expiry markers are derived from wall-clock gaps between consecutive
+calls, not reported by the transcript, and are suppressed where a compaction
+lands on the same call — compaction forces a cache write regardless, so the
+lapse costs nothing extra there. Both TTL thresholds are drawn for every
+session regardless of which TTL it ran under, because the value is
+counterfactual in both directions.
+
 Because the watcher reads real local session history, output is not
 reproducible across machines — don't assume specific totals in tests.

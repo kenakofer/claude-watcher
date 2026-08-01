@@ -24,9 +24,22 @@
     /* Cumulative-cost overlay. Deliberately outside the band palette so the
        line never reads as a fifth token type. */
     --cumulative: #7a4fd0;
-    /* Money grid overlay. Near-neutral on purpose: it sits on top of the data,
-       so any real hue would read as another series. */
-    --money-grid: #0b0b0b;
+    /* Money grid overlay. Shares the cumulative-cost hue because it encodes the
+       same quantity — dollars — so the two money-denominated marks read as one
+       family, and both stay outside the band palette so neither reads as a
+       fifth token type.
+       Separation from the line comes from the hairline stroke and the grid's
+       regularity, not from muting the hue: the grid was previously toned down
+       until it was invisible over the data. Light mode runs a shade darker than
+       `--cumulative` for contrast against the light plane; dark mode matches
+       the line exactly. */
+    --money-grid: #5b32ab;
+    /* Prompt-cache expiry markers. One hue for both TTLs: a 5m and a 1h lapse
+       are the same event at different thresholds, so they are distinguished by
+       dash pattern rather than color. Distinct from `--critical` because a
+       compaction is something Claude Code did, while an expiry is just time
+       passing — conflating them would imply a causal link that isn't there. */
+    --cache-expiry: #0f8f8f;
     --good: #0ca30c;
     --critical: #d03b3b;
   }
@@ -46,7 +59,8 @@
       --series-3: #199e70;
       --series-4: #c98500;
       --cumulative: #a687ea;
-      --money-grid: #ffffff;
+      --money-grid: #a687ea;
+      --cache-expiry: #2fbdbd;
     }
   }
   :root[data-theme="dark"] {
@@ -64,7 +78,8 @@
     --series-3: #199e70;
     --series-4: #c98500;
     --cumulative: #a687ea;
-    --money-grid: #ffffff;
+    --money-grid: #a687ea;
+    --cache-expiry: #2fbdbd;
   }
 
   * { box-sizing: border-box; }
@@ -159,6 +174,15 @@
   .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 12px; }
   .legend .item { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); }
   .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+  /* Line swatches for marks drawn as rules rather than filled bands. The
+     dash pattern has to match what the chart draws, or the legend stops being
+     a key and becomes a second, contradictory encoding. */
+  .swatch.line {
+    height: 0; border-radius: 0; width: 14px;
+    border-top: 2px solid currentColor; align-self: center;
+  }
+  .swatch.line-5m { border-top-style: dotted; }
+  .swatch.line-1h { border-top-style: dashed; }
 
   table { border-collapse: collapse; width: 100%; font-size: 13px; }
   th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
@@ -784,9 +808,11 @@ function renderSessionDetail(session, events) {
     (ts) => (!firstCallTs || ts >= firstCallTs) && (!lastCallTs || ts <= lastCallTs),
   );
 
+  const compactedAt = new Set();
   for (const ts of inRange) {
     const idx = points.findIndex((p) => p.e.timestamp && p.e.timestamp >= ts);
     if (idx < 0) continue;
+    compactedAt.add(idx);
     // The boundary falls between the previous call and this one, so in bar
     // mode draw it at the leading edge of the band rather than through the
     // middle of a column it didn't split.
@@ -797,6 +823,56 @@ function renderSessionDetail(session, events) {
     }));
   }
   const outOfRange = allCompactions.length - inRange.length;
+
+  // Prompt-cache expiry markers.
+  //
+  // Derived, not reported: the transcript records no expiry event, so this is
+  // inferred from the wall-clock gap between consecutive calls. If the gap
+  // exceeded the TTL, the cache written by the earlier call was cold by the
+  // time the later one ran, and that later call had to re-cache the context at
+  // the write rate (1.25x/2x input) instead of reading it back at 0.1x.
+  //
+  // Both thresholds are always drawn regardless of which TTL the session
+  // actually used, because the useful question is counterfactual: on a 5m
+  // session the 1h marks show which lapses you would have avoided, and on a 1h
+  // session the 5m marks show what switching would have cost. A 1h lapse is
+  // necessarily also a 5m lapse, so the two are drawn as one marker promoted to
+  // the longer TTL rather than two lines on the same pixel.
+  //
+  // Placed at the leading edge of the call that paid for it, matching the
+  // compaction markers: the gap sits between two calls, so drawing it through
+  // the middle of a column would attribute it to a call it didn't split.
+  //
+  // Suppressed where a compaction lands on the same call. Compaction rewrites
+  // the context, so the next call pays the write rate whether or not the cache
+  // was still warm -- the expiry cost nothing extra there, and a second line on
+  // the same pixel would double-count one event and clutter the marker.
+  const CACHE_TTL_5M_S = 300;
+  const CACHE_TTL_1H_S = 3600;
+  const expiries = [];
+  for (let i = 1; i < points.length; i += 1) {
+    if (compactedAt.has(i)) continue;
+    const prev = points[i - 1].e.timestamp;
+    const curr = points[i].e.timestamp;
+    if (!prev || !curr) continue;
+    const gapS = (Date.parse(curr) - Date.parse(prev)) / 1000;
+    if (!Number.isFinite(gapS) || gapS <= CACHE_TTL_5M_S) continue;
+    expiries.push({ i, gapS, ttl: gapS > CACHE_TTL_1H_S ? '1h' : '5m' });
+  }
+  for (const ex of expiries) {
+    const mx = useBars ? m.left + band * ex.i : x(ex.i);
+    svg.appendChild(svgEl('line', {
+      x1: mx, x2: mx, y1: m.top, y2: m.top + plotH,
+      stroke: 'var(--cache-expiry)', 'stroke-width': 1,
+      // Same hue for both, so the dash is what separates them: a 1h lapse is
+      // the rarer, more expensive event and gets the longer, more assertive
+      // dash. Both dashed, so neither is mistaken for a solid compaction line.
+      'stroke-dasharray': ex.ttl === '1h' ? '8 3' : '2 4',
+      'stroke-opacity': ex.ttl === '1h' ? 0.95 : 0.7,
+    }));
+  }
+  const expired5m = expiries.filter((e) => e.ttl === '5m').length;
+  const expired1h = expiries.filter((e) => e.ttl === '1h').length;
 
   // Stacked bands, drawn bottom band first. Each band is the region between
   // the running total below it and the running total including it, so the
@@ -857,24 +933,30 @@ function renderSessionDetail(session, events) {
   // correcting for a stretched aspect. Solving side^2 = cell$ x px-per-call x
   // px-per-dollar gives the side for a given cell value.
   //
-  // The cell value is not pinned to exactly $1. A literal $1 cell measures
-  // anywhere from 11px to 355px across the real sessions here — unreadable
-  // noise at one end, two cells on the whole plot at the other. Instead the
-  // value steps in powers of ten to land the side near TARGET px; $1 is simply
-  // what it picks when the data is in the range where $1 is legible. The chosen
-  // value is stated in the legend, so the unit is never ambiguous.
+  // The cell value steps in powers of ten to land the side near TARGET px, and
+  // the chosen value is stated in the legend so the unit is never ambiguous.
   //
   // Powers of ten only, rather than a finer 1-2-5 ladder: a decade step keeps
   // the label a plain "$1" or "$10" instead of "$0.05" or "$50", and mental
-  // arithmetic over the squares stays trivial. The cost is a wider spread in
-  // cell size (27-71px across these sessions, against 36-50px for 1-2-5),
-  // which is well inside the legible range.
+  // arithmetic over the squares stays trivial.
+  //
+  // The ladder starts at $1 — no sub-dollar cells. A grid whose unit is $0.001
+  // is technically well-sized but practically meaningless: "count the squares"
+  // stops being a useful gesture when a square is a tenth of a cent, and the
+  // legend reads as noise. $1 is the smallest unit anyone actually reasons in,
+  // so it is the floor even where a smaller cell would fit the plot better.
+  //
+  // Consequence, and why the guard below has an upper bound: on a short or
+  // cheap session a $1 cell can be larger than the plot (up to ~1968px across
+  // these sessions, against a plot ~836px wide). That is not a grid, it is one
+  // stray line, so those sessions draw no grid at all rather than a misleading
+  // fragment. About a third of sessions here land that way.
   let moneyGrid = null;
   if (costMode) {
     const MONEY_GRID_TARGET_PX = 42;
     const pxPerCall = plotW / points.length;
     const pxPerDollar = plotH / top;
-    for (let e = -4; e <= 4; e += 1) {
+    for (let e = 0; e <= 4; e += 1) {
       const value = 10 ** e;
       const side = Math.sqrt(value * pxPerCall * pxPerDollar);
       const score = Math.abs(Math.log(side / MONEY_GRID_TARGET_PX));
@@ -882,7 +964,15 @@ function renderSessionDetail(session, events) {
     }
   }
 
-  if (moneyGrid && Number.isFinite(moneyGrid.side) && moneyGrid.side > 4) {
+  // Needs at least ~2 cells on each axis to read as a grid. Without the upper
+  // bound the $1 floor would draw a single line across an otherwise empty plot
+  // on short sessions, which looks like a rendering bug rather than a unit.
+  const gridFits = moneyGrid
+    && Number.isFinite(moneyGrid.side)
+    && moneyGrid.side > 4
+    && moneyGrid.side <= plotW / 2
+    && moneyGrid.side <= plotH / 2;
+  if (gridFits) {
     const side = moneyGrid.side;
     const defs = svgEl('defs');
     // Unique per render: several charts can share the document, and a repeated
@@ -900,94 +990,38 @@ function renderSessionDetail(session, events) {
     });
     pattern.appendChild(svgEl('path', {
       d: `M0,0 H${side} M0,0 V${side}`,
-      fill: 'none', stroke: 'var(--money-grid)', 'stroke-width': 1,
+      // 1.5px: a 1px line lands on a fractional device pixel at most container
+      // widths and gets antialiased into a smear, which cost the grid more
+      // visibility than any color choice did.
+      fill: 'none', stroke: 'var(--money-grid)', 'stroke-width': 1.5,
     }));
     defs.appendChild(pattern);
 
-    // The reveal. A radial gradient drives a luminance mask: white shows the
-    // grid, black hides it. The halo is the white core following the cursor;
-    // the edge frame is a separate always-on band so the grid is discoverable
-    // before the mouse ever enters the plot, and so it reads as a real chart
-    // element rather than a hover gimmick.
-    const grad = svgEl('radialGradient', {
-      id: `${uid}-g`, gradientUnits: 'userSpaceOnUse',
-      // Parked off-canvas until the first mousemove, so no halo is visible
-      // until the pointer actually arrives.
-      cx: -9999, cy: -9999, r: side * 3.2,
-    });
-    // Fades to nothing well before the radius, so there is no hard rim.
-    for (const [offset, opacity] of [[0, 1], [0.45, 0.75], [0.75, 0.25], [1, 0]]) {
-      grad.appendChild(svgEl('stop', {
-        offset, 'stop-color': '#fff', 'stop-opacity': opacity,
-      }));
-    }
-    defs.appendChild(grad);
-
-    const mask = svgEl('mask', { id: `${uid}-m`, maskUnits: 'userSpaceOnUse',
-      x: m.left, y: m.top, width: plotW, height: plotH,
-      // Isolate so the screened layers below blend against this mask's own
-      // backdrop and not whatever happens to sit behind the chart.
-      style: 'isolation:isolate' });
-    // Opaque black base: `screen` needs something to brighten against, and a
-    // mask with no base is transparent, which composites unpredictably.
-    mask.appendChild(svgEl('rect', {
-      x: m.left, y: m.top, width: plotW, height: plotH, fill: '#000',
-    }));
-    // Edge frame: brightest at the plot border, gone by `fade` inward. Built
-    // from four linear gradients rather than one inset shape so the corners sum
-    // smoothly instead of showing a mitre seam.
-    const fade = Math.min(side * 1.6, plotW / 2, plotH / 2);
-    const edges = [
-      ['x1', m.left, 'y1', m.top, 'x2', m.left + fade, 'y2', m.top],
-      ['x1', m.left + plotW, 'y1', m.top, 'x2', m.left + plotW - fade, 'y2', m.top],
-      ['x1', m.left, 'y1', m.top, 'x2', m.left, 'y2', m.top + fade],
-      ['x1', m.left, 'y1', m.top + plotH, 'x2', m.left, 'y2', m.top + plotH - fade],
-    ];
-    edges.forEach((coords, gi) => {
-      const eg = svgEl('linearGradient', { id: `${uid}-e${gi}`, gradientUnits: 'userSpaceOnUse' });
-      for (let ci = 0; ci < coords.length; ci += 2) eg.setAttribute(coords[ci], coords[ci + 1]);
-      eg.appendChild(svgEl('stop', { offset: 0, 'stop-color': '#fff', 'stop-opacity': 0.55 }));
-      eg.appendChild(svgEl('stop', { offset: 1, 'stop-color': '#fff', 'stop-opacity': 0 }));
-      defs.appendChild(eg);
-      mask.appendChild(svgEl('rect', {
-        x: m.left, y: m.top, width: plotW, height: plotH, fill: `url(#${uid}-e${gi})`,
-        // Layers inside a mask composite normally, so each rect would paint
-        // over the last and only the final one would survive. `screen` takes
-        // the brighter of the two instead, letting the four edges and the halo
-        // build one combined reveal rather than erasing each other.
-        style: 'mix-blend-mode:screen',
-      }));
-    });
-    // The halo itself, over the frame and screened against it for the same
-    // reason, so it brightens the edges where the two overlap.
-    const haloRect = svgEl('rect', {
-      x: m.left, y: m.top, width: plotW, height: plotH, fill: `url(#${uid}-g)`,
-      style: 'mix-blend-mode:screen',
-    });
-    mask.appendChild(haloRect);
-    defs.appendChild(mask);
+    // The grid draws uniformly across the whole plot — no reveal, no fade.
+    //
+    // This previously ran through a luminance mask: first a cursor-following
+    // halo, then an edge-only frame that faded to nothing toward the centre.
+    // Both are gone. The halo made the cost view laggy (every mousemove
+    // re-resolved the mask and recomposited the grid across the plot), and the
+    // edge fade meant the grid was absent from exactly the middle region where
+    // you actually count squares under the stack.
+    //
+    // Dropping the mask also removes a trap: a luminance mask multiplies the
+    // stroke's own brightness, so saturating the purple made the grid dimmer
+    // and the only way to brighten it was to wash the color out. Now the stroke
+    // color is the only thing controlling how the grid reads.
     svg.appendChild(defs);
 
+    // The rect's own bounds clip the pattern to the plot, so no clip-path is
+    // needed now that the mask is gone.
     svg.appendChild(svgEl('rect', {
       x: m.left, y: m.top, width: plotW, height: plotH,
-      fill: `url(#${uid}-p)`, mask: `url(#${uid}-m)`,
-      'fill-opacity': 0.45, 'pointer-events': 'none',
+      fill: `url(#${uid}-p)`,
+      // Slightly under 1 so the grid sits behind the data rather than competing
+      // with it — the only restraint left now that the fade is gone, which is
+      // why it is a light touch rather than the old 0.45.
+      'fill-opacity': 0.85, 'pointer-events': 'none',
     }));
-
-    // Move the halo by mutating the gradient centre only — no re-render, so
-    // this stays cheap on the 9000-call sessions. Bound to the SVG rather than
-    // the hit rects because those are added per band and would miss the gaps.
-    svg.addEventListener('mousemove', (ev) => {
-      const rect = svg.getBoundingClientRect();
-      if (!rect.width) return;
-      // Client px -> viewBox units, since the SVG scales to its container.
-      grad.setAttribute('cx', ((ev.clientX - rect.left) / rect.width) * W);
-      grad.setAttribute('cy', ((ev.clientY - rect.top) / rect.height) * H);
-    });
-    svg.addEventListener('mouseleave', () => {
-      grad.setAttribute('cx', -9999);
-      grad.setAttribute('cy', -9999);
-    });
   }
 
   // Cumulative cost, overlaid on its own scale. Drawn after the bands so it
@@ -1159,7 +1193,10 @@ function renderSessionDetail(session, events) {
     //    decimals to show it and no more: fmtAxisUSD would render these as
     //    "$1.0" and "$0.0010", trailing digits implying a precision the value
     //    doesn't have.
-    (moneyGrid
+    // `gridFits`, not `moneyGrid`: a value is always chosen, but it is only
+    // drawn when it fits the plot. Keying the legend off the value alone would
+    // announce a grid square that is nowhere on screen.
+    (gridFits
       ? `<span class="item muted">Grid square = ` +
         `$${moneyGrid.value.toFixed(Math.max(0, -Math.round(Math.log10(moneyGrid.value))))} of spend` +
         `${useBars ? ' (per column band, not the drawn bar width)' : ' — count squares under the curve'}</span>`
@@ -1169,6 +1206,19 @@ function renderSessionDetail(session, events) {
       : '') +
     (outOfRange
       ? `<span class="item muted">${outOfRange} compaction${outOfRange > 1 ? 's' : ''} outside the plotted calls</span>`
+      : '') +
+    // Only shown when there is something to point at. A session with no lapses
+    // is the common case, and a permanent "0 expiries" entry would add noise to
+    // every chart to report a non-event.
+    (expired5m
+      ? `<span class="item" style="color:var(--cache-expiry)">` +
+        `<span class="swatch line line-5m"></span>` +
+        `<span style="color:var(--text-secondary)">5m cache lapse (${expired5m})</span></span>`
+      : '') +
+    (expired1h
+      ? `<span class="item" style="color:var(--cache-expiry)">` +
+        `<span class="swatch line line-1h"></span>` +
+        `<span style="color:var(--text-secondary)">1h cache lapse (${expired1h})</span></span>`
       : '') +
     (clipped
       ? `<span class="item muted">${clipped} call${clipped > 1 ? 's' : ''} above ${fmtAxisUSD(costCeiling)} clipped to the top — hover for the real figure</span>`
@@ -1205,7 +1255,12 @@ function renderSessionDetail(session, events) {
 let stats = null;
 let sessions = [];
 let selectedId = null;
-let detailMode = 'absolute'; // 'absolute' (tokens) | 'cost'
+// 'cost' (money per turn) | 'absolute' (tokens per turn). Cost is the default:
+// cache read is a median ~99% of every turn, so on the token axis the other
+// three bands are sub-pixel and the chart opens on a view where nothing but
+// cache read is legible. Weighting by $/token lifts the thin-but-expensive
+// bands into view, so the first thing shown is where the money went.
+let detailMode = 'cost';
 // Horizontal zoom over the session chart, as a half-open index range into the
 // call list — not a pixel transform. Keeping it in call space means the
 // bar/area threshold, the tooltips and the compaction markers all keep working
