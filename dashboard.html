@@ -157,12 +157,6 @@
   /* Nested table-view disclosures keep the default marker but stay recessive. */
   summary.minor { font-size: 12px; color: var(--text-secondary); cursor: pointer; }
 
-  /* Hero + stat tiles */
-  .tiles { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
-  .tile .label { font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
-  .tile .value { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; }
-  .tile .value.hero { font-size: 48px; line-height: 1.05; }
-  .tile .meta { font-size: 12px; color: var(--muted); margin-top: 4px; }
 
   svg { display: block; width: 100%; overflow: visible; }
   .grid-line { stroke: var(--grid); stroke-width: 1; }
@@ -252,10 +246,6 @@
 </header>
 
 <main>
-  <section class="card">
-    <div class="tiles" id="tiles"></div>
-  </section>
-
   <details class="card panel" id="detail-card" open>
     <summary><h2 id="detail-title">Session breakdown</h2></summary>
     <div class="panel-body">
@@ -1269,40 +1259,6 @@ let detailMode = 'cost';
 let detailZoom = null; // { start, end } | null
 let detailData = null;       // last-rendered session payload, for re-render on toggle
 
-function renderTiles() {
-  const t = stats.totals;
-  const today = new Date().toISOString().slice(0, 10);
-  const todayRow = stats.daily.find((d) => d.day === today);
-  const cacheShare = t.cost > 0 ? ((t.costCacheRead + t.costCacheWrite) / t.cost) * 100 : 0;
-
-  el('tiles').innerHTML = `
-    <div class="tile">
-      <div class="label">Total spend</div>
-      <div class="value hero">${fmtUSD(t.cost)}</div>
-      <div class="meta">${fmtInt(t.sessions)} sessions · ${fmtInt(t.calls)} model calls</div>
-    </div>
-    <div class="tile">
-      <div class="label">Today</div>
-      <div class="value">${fmtUSD(todayRow ? todayRow.cost : 0)}</div>
-      <div class="meta">${todayRow ? fmtInt(todayRow.calls) + ' calls' : 'no calls yet'}</div>
-    </div>
-    <div class="tile">
-      <div class="label">Cache read tokens</div>
-      <div class="value">${compact(t.cacheReadTokens)}</div>
-      <div class="meta">${cacheShare.toFixed(0)}% of spend is cache</div>
-    </div>
-    <div class="tile">
-      <div class="label">Output tokens</div>
-      <div class="value">${compact(t.outputTokens)}</div>
-      <div class="meta">${fmtInt(t.prompts)} prompts · ${fmtInt(t.toolCalls)} tool calls</div>
-    </div>
-    <div class="tile">
-      <div class="label">Compactions</div>
-      <div class="value">${fmtInt(t.compactions)}</div>
-      <div class="meta">context resets across all sessions</div>
-    </div>`;
-}
-
 function renderSessions() {
   const rows = sessions.slice(0, 60);
   el('sessions-table').innerHTML =
@@ -1362,7 +1318,6 @@ const panelOpen = (id) => {
 };
 
 function renderAll() {
-  renderTiles();
   if (panelOpen('daily')) renderDaily(stats.daily);
 
   if (panelOpen('models')) renderBars('models', 'models-table', stats.models, {
