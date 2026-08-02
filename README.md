@@ -75,9 +75,6 @@ model calls, so the breakdown is populated on first paint.
   percentile. Clipped calls are counted in the legend and still report their
   true value on hover — nothing is silently dropped.
 
-- **Spend per day**, stacked by token type. For typical Claude Code use most of
-  the bar is cache read.
-- **Cost by model** — total spend attributed per model.
 - **Sessions table** — AI-generated titles, project, calls, current context
   window, cost, last activity. Subagent runs are tagged with their agent type.
   Selecting a row retargets the session breakdown above.

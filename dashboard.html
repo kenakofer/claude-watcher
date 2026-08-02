@@ -122,11 +122,83 @@
   button.ghost:hover { background: var(--surface-1); }
 
   main { padding: 0 24px 40px; display: grid; gap: 16px; }
-  .row { display: grid; gap: 16px; }
-  /* align-items:start so a collapsed panel keeps its own height instead of
-     stretching to match an expanded sibling. */
-  @media (min-width: 900px) {
-    .row.two { grid-template-columns: 1fr 1fr; align-items: start; }
+
+  /* Sessions is first in the DOM so it lands at the top of the left column in
+     the wide layout below. Single-column screens want the opposite order —
+     the breakdown is the main view and the session list is the picker under
+     it — so push Sessions to the end visually. `order` rather than moving the
+     element back, because both layouts read from the same source order.
+
+     Everything else keeps the default `order: 0` and so stays in DOM order
+     ahead of it; only the one panel needs a rule. */
+  @media (max-width: 1279.98px) {
+    #sessions-card { order: 1; }
+  }
+
+  /* Wide screens: Sessions takes the whole left half and the breakdown fills
+     the right half.
+
+     Done by placing panels into an explicit two-column grid on `main` rather
+     than by wrapping each side in a column div, because preserveScroll()
+     anchors on `main > .panel` — a wrapper would hide every panel from that
+     selector and break scroll preservation on live updates.
+
+     Below 1280px nothing changes and the page stays as it was. */
+  @media (min-width: 1280px) {
+    main {
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      align-items: start;
+    }
+    /* Sessions: left column, spanning every row the right column produces. */
+    #sessions-card {
+      grid-column: 1;
+      grid-row: 1 / -1;
+      /* Its own scroll region, so a long session list neither stretches the
+         grid nor pushes the right column's charts off screen. Capped against
+         the viewport rather than the sibling column: matching the right
+         column's height would need JS, and the sticky top offset keeps the
+         header clear. */
+      position: sticky;
+      top: 16px;
+      max-height: calc(100vh - 32px);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    #sessions-card > .panel-body {
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+    /* The table box scrolls in both directions here; .scroll is otherwise
+       horizontal-only. */
+    #sessions-card .scroll { overflow-y: auto; min-height: 0; }
+    main > .panel:not(#sessions-card) { grid-column: 2; }
+
+    /* The breakdown is the only panel in the right column, so it stretches to
+       the height of the Sessions card beside it instead of sitting
+       content-sized. `align-items: start` on main would otherwise size it to
+       its content; the row is already the full grid height, so stretching into
+       it needs no explicit height. Only when open — a collapsed <details> must
+       stay at its summary height. */
+       The max-height is what makes the measurement terminate: without a cap the
+       card grows to fit whatever SVG was just drawn, that growth feeds back as
+       more slack on the next render, and the chart ratchets taller each pass.
+       Bounded by the viewport, as the Sessions card is. */
+    #detail-card[open] {
+      align-self: stretch;
+      max-height: calc(100vh - 32px);
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    /* Stretches to the card so the chart has a real box to measure against;
+       `align-items` stays at its stretch default, so rows keep full width. */
+    #detail-card[open] > .panel-body {
+      flex: 1;
+      min-height: 0;
+    }
   }
 
   .card {
@@ -191,6 +263,11 @@
 
 
   svg { display: block; width: 100%; overflow: visible; }
+  /* The detail SVG carries no height attribute: the JS puts the height it laid
+     the drawing out for into the viewBox and publishes it as this variable, so
+     the element matches the geometry rather than scaling to fit. The fallback
+     is the same 420px floor the JS uses, for the narrow layout. */
+  #detail-chart svg { height: var(--detail-chart-h, 420px); }
   .grid-line { stroke: var(--grid); stroke-width: 1; }
   .axis-line { stroke: var(--axis); stroke-width: 1; }
   .tick { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
@@ -217,7 +294,7 @@
   tbody tr:hover { background: var(--plane); }
   tbody tr.selected { background: var(--plane); }
   .scroll { overflow-x: auto; }
-  .name { max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
+  .name { max-width: 225px; overflow: hidden; text-overflow: ellipsis; }
 
   .pill {
     display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px;
@@ -278,6 +355,16 @@
 </header>
 
 <main>
+  <!-- First in the DOM so the wide two-column layout puts it at the top of the
+       left column; on narrow screens this also puts the session list above the
+       breakdown it drives, which is the order you read them in. -->
+  <details class="card panel" id="sessions-card" open>
+    <summary><h2>Sessions</h2></summary>
+    <div class="panel-body">
+      <div class="scroll"><table id="sessions-table"></table></div>
+    </div>
+  </details>
+
   <details class="card panel" id="detail-card" open>
     <summary><h2 id="detail-title">Session breakdown</h2></summary>
     <div class="panel-body">
@@ -305,40 +392,6 @@
     </div>
   </details>
 
-  <div class="row two">
-    <details class="card panel">
-      <summary><h2>Spend per day</h2></summary>
-      <div class="panel-body">
-        <p class="sub">Stacked by token type. Hover a column for the breakdown.</p>
-        <div id="daily"></div>
-        <div class="legend" id="daily-legend"></div>
-        <details>
-          <summary class="minor">Table view</summary>
-          <div class="scroll"><table id="daily-table"></table></div>
-        </details>
-      </div>
-    </details>
-
-    <details class="card panel">
-      <summary><h2>Cost by model</h2></summary>
-      <div class="panel-body">
-        <p class="sub">Total spend attributed per model.</p>
-        <div id="models"></div>
-        <details>
-          <summary class="minor">Table view</summary>
-          <div class="scroll"><table id="models-table"></table></div>
-        </details>
-      </div>
-    </details>
-  </div>
-
-  <details class="card panel" open>
-    <summary><h2>Sessions</h2></summary>
-    <div class="panel-body">
-      <p class="sub">Newest first. Select a row to chart its token usage per turn.</p>
-      <div class="scroll"><table id="sessions-table"></table></div>
-    </div>
-  </details>
 </main>
 
 <div id="tip" role="status" aria-live="polite"></div>
@@ -386,18 +439,10 @@ const compact = (n) => {
   return String(n);
 };
 
-// Token-type series, in fixed slot order. Color follows the entity — never
-// reassigned by rank — so a series keeps its hue as data changes.
-const SERIES = [
-  { key: 'costCacheRead',  token: 'cacheReadTokens',       label: 'Cache read',  color: 'var(--series-1)' },
-  { key: 'costCacheWrite', token: 'cacheCreationTokens',   label: 'Cache write', color: 'var(--series-2)' },
-  { key: 'costOutput',     token: 'outputTokens',          label: 'Output',      color: 'var(--series-3)' },
-  { key: 'costInput',      token: 'inputTokens',           label: 'Input',       color: 'var(--series-4)' },
-];
-
 // Stack order for the per-session token chart, bottom band first. Cache read is
 // the largest and sits on the baseline so the smaller bands stay readable above
-// it; the hues match SERIES so a token type means the same color everywhere.
+// it. Color follows the entity — never reassigned by rank — so a token type
+// keeps its hue as data changes.
 //
 // `quota` is the band's weight in output-token equivalents, and it is what
 // usage mode stacks. Cache read and input weigh zero — the 5-hour meter does
@@ -670,8 +715,14 @@ function preserveScroll(render) {
   let anchor = null;
   for (const node of anchors) {
     const top = node.getBoundingClientRect().top;
-    // First element whose top edge is at or below the viewport top.
-    if (top >= 0) { anchor = { node, top, id: node.dataset && node.dataset.id }; break; }
+    // Topmost element whose top edge is at or below the viewport top. Chosen by
+    // measured position rather than by taking the first match in DOM order: the
+    // narrow layout gives #sessions-card `order: 1`, so DOM order and visual
+    // order differ, and stopping at the first match would anchor on a panel far
+    // below the viewport whenever the user has scrolled past the breakdown.
+    if (top >= 0 && (!anchor || top < anchor.top)) {
+      anchor = { node, top, id: node.dataset && node.dataset.id };
+    }
   }
   render();
   if (!anchor) return;
@@ -704,167 +755,17 @@ function niceTicks(max, count = 4, cover = false) {
   return ticks;
 }
 
-// --- Stacked column chart: spend per day ------------------------------------
-function renderDaily(daily) {
-  const host = el('daily');
-  // No pre-clear: the host keeps its old contents (and so its width, which is
-  // measured below) until the finished chart replaces them in one swap.
-  if (!daily.length) {
-    setChildren(host, emptyNote('No priced calls yet.'));
-    return;
-  }
-
-  const days = daily.slice(-30);
-  const W = Math.max(host.clientWidth || 720, 320);
-  const H = 240;
-  // Reserve a band for the x-axis labels so the card never needs its own scroll.
-  const m = { top: 12, right: 12, bottom: 30, left: 52 };
-  const plotW = W - m.left - m.right;
-  const plotH = H - m.top - m.bottom;
-
-  const max = Math.max(...days.map((d) => d.cost), 0.0001);
-  // Cover the data with a little headroom so the tallest column isn't clipped
-  // by the top gridline (see niceTicks).
-  const ticks = niceTicks(max * 1.06, 4, true);
-  const top = ticks[ticks.length - 1];
-  const y = (v) => m.top + plotH - (v / top) * plotH;
-
-  const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, height: H });
-
-  for (const t of ticks) {
-    svg.appendChild(svgEl('line', {
-      class: 'grid-line', x1: m.left, x2: m.left + plotW, y1: y(t), y2: y(t),
-    }));
-    const label = svgEl('text', { class: 'tick', x: m.left - 8, y: y(t) + 4, 'text-anchor': 'end' });
-    label.textContent = t >= 1 ? '$' + Math.round(t) : '$' + t.toFixed(2);
-    svg.appendChild(label);
-  }
-
-  const band = plotW / days.length;
-  // Full band but for a fixed 2px separator — same reasoning as the session
-  // chart's bars: these are stacked dollars, so the bar's area carries the
-  // quantity, and a bar drawn at a fraction of its band understates it.
-  const BAR_GAP = 2;
-  const barW = Math.max(1, band - BAR_GAP);
-  const GAP = 2; // surface gap between stacked segments
-
-  days.forEach((d, i) => {
-    const cx = m.left + band * (i + 0.5);
-    const x = cx - barW / 2;
-    let cursor = 0;
-
-    for (const s of SERIES) {
-      const value = d[s.key] || 0;
-      if (value <= 0) continue;
-      const yTop = y(cursor + value);
-      const yBottom = y(cursor);
-      const h = Math.max(0, yBottom - yTop - GAP);
-      if (h > 0) {
-        svg.appendChild(svgEl('rect', {
-          x, y: yTop, width: barW, height: h, rx: 2, fill: s.color,
-        }));
-      }
-      cursor += value;
-    }
-
-    // Hit target spans the full band so hovering never demands pixel precision.
-    const hit = svgEl('rect', {
-      x: m.left + band * i, y: m.top, width: band, height: plotH, fill: 'transparent',
-    });
-    hit.addEventListener('mousemove', (e) =>
-      showTip(e, d.day, [
-        ...SERIES.map((s) => [s.label, fmtUSD(d[s.key] || 0)]),
-        ['Total', fmtUSD(d.cost)],
-        ['Calls', fmtInt(d.calls)],
-      ]));
-    hit.addEventListener('mouseleave', hideTip);
-    svg.appendChild(hit);
-
-    // Label every ~5th day so ticks never collide.
-    if (days.length <= 10 || i % Math.ceil(days.length / 8) === 0) {
-      const t = svgEl('text', {
-        class: 'tick', x: cx, y: m.top + plotH + 18, 'text-anchor': 'middle',
-      });
-      t.textContent = d.day.slice(5);
-      svg.appendChild(t);
-    }
-  });
-
-  svg.appendChild(svgEl('line', {
-    class: 'axis-line', x1: m.left, x2: m.left + plotW,
-    y1: m.top + plotH, y2: m.top + plotH,
-  }));
-  setChildren(host, svg);
-
-  el('daily-legend').innerHTML = SERIES.map(
-    (s) => `<span class="item"><span class="swatch" style="background:${s.color}"></span>${s.label}</span>`,
-  ).join('');
-
-  setTableHTML(el('daily-table'),
-    '<thead><tr><th>Day</th>' +
-    SERIES.map((s) => `<th class="num">${s.label}</th>`).join('') +
-    '<th class="num">Total</th><th class="num">Calls</th></tr></thead><tbody>' +
-    days.map((d) =>
-      `<tr><td>${d.day}</td>` +
-      SERIES.map((s) => `<td class="num">${fmtUSD(d[s.key] || 0)}</td>`).join('') +
-      `<td class="num">${fmtUSD(d.cost)}</td><td class="num">${fmtInt(d.calls)}</td></tr>`,
-    ).join('') +
-    '</tbody>');
-}
-
-// --- Horizontal bars: one series, one color --------------------------------
-function renderBars(hostId, tableId, rows, opts) {
-  const host = el(hostId);
-  if (!rows.length) { setChildren(host, emptyNote('Nothing recorded yet.')); return; }
-
-  const items = rows.slice(0, opts.limit || 8);
-  const rowH = 30;
-  const W = Math.max(host.clientWidth || 400, 280);
-  const labelW = Math.min(150, Math.max(90, W * 0.32));
-  const valueW = 68;
-  const plotW = Math.max(40, W - labelW - valueW - 8);
-  const H = items.length * rowH + 4;
-  const max = Math.max(...items.map(opts.value), 1e-9);
-
-  const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, height: H });
-
-  items.forEach((item, i) => {
-    const cy = i * rowH + rowH / 2;
-    const value = opts.value(item);
-    const w = Math.max(2, (value / max) * plotW);
-
-    const label = svgEl('text', {
-      class: 'axis-label', x: labelW - 10, y: cy + 4, 'text-anchor': 'end',
-    });
-    label.textContent = opts.label(item);
-    svg.appendChild(label);
-
-    svg.appendChild(svgEl('rect', {
-      x: labelW, y: cy - 7, width: w, height: 14, rx: 4, fill: 'var(--series-1)',
-    }));
-
-    // Direct label at the tip — selective by construction (one value per bar).
-    const out = svgEl('text', {
-      class: 'tick', x: labelW + w + 8, y: cy + 4, fill: 'var(--text-secondary)',
-    });
-    out.textContent = opts.display(item);
-    svg.appendChild(out);
-
-    const hit = svgEl('rect', { x: 0, y: i * rowH, width: W, height: rowH, fill: 'transparent' });
-    hit.addEventListener('mousemove', (e) => showTip(e, opts.label(item), opts.tip(item)));
-    hit.addEventListener('mouseleave', hideTip);
-    svg.appendChild(hit);
-  });
-
-  setChildren(host, svg);
-  setTableHTML(el(tableId), opts.table(rows));
-}
-
-// Below this many calls, the session breakdown is drawn as discrete stacked
-// columns: each call is a real event, and at this density a bar per call is
-// both readable and honest about that. Above it the bars are thinner than
-// their own gaps, so the stacked area reads better as a trend.
-const BAR_MODE_MAX_CALLS = 400;
+// A call gets its own column while its band is at least this wide: each call is
+// a real event, and at this density a bar per call is both readable and honest
+// about that. Below it the bar is thinner than the BAR_GAP that separates it
+// from its neighbour, so the columns read as noise and the stacked area reads
+// better as a trend.
+//
+// This is a pixel width, not a call count, because that is the quantity the
+// legibility actually depends on: the same 400 calls are comfortable columns in
+// a wide window and a grey smear in a narrow one. A count threshold picks one
+// window width and is wrong at every other.
+const MIN_BAR_BAND_PX = 5;
 
 // Never zoom in past this many calls: below it the columns are wide enough
 // that further zoom just adds whitespace without revealing anything.
@@ -906,17 +807,19 @@ function detailCallCount() {
 //
 // Usage mode reports the whole session's quota draw, in the same unit as the
 // chart below it. That can exceed 100%: a long session straddles window resets,
-// and where those boundaries fall is not in the transcript. So the label says
-// "across the session" rather than implying a single window — the honest
-// reading is "this much of a window's worth of quota", not "this fraction of
-// your current limit".
+// and where those boundaries fall is not in the transcript. The honest reading
+// is "this much of a window's worth of quota", not "this fraction of your
+// current limit" — the short label can't carry that, so the scope and the
+// over-100% case live in the tooltip.
 //
 // `usageEquiv` is in output-token equivalents, which only the caller that has
 // weighted every call can supply.
 function setHeadline(session, usageEquiv) {
   el('detail-total').innerHTML = detailMode === 'usage'
     ? `${(usageEquiv / QUOTA_OUTPUT_TOKENS_PER_PERCENT).toFixed(1)}%` +
-      '<span class="headline-label">of a 5-hour window, across the session</span>'
+      '<span class="headline-label" title="Output plus cache write across the ' +
+      'whole session, in percent of a 5-hour window. A long session straddles ' +
+      'window resets, so this can exceed 100%.">of 5hr. window</span>'
     : `${fmtUSD(session.totals.cost)}<span class="headline-label">session total</span>`;
 }
 
@@ -1103,7 +1006,24 @@ function renderSessionDetail(session, events) {
   const costMode = detailMode === 'cost';
 
   const W = Math.max(host.clientWidth || 720, 320);
-  const H = 420;
+  // 420 unless the wide layout has given the card a taller box to fill: there
+  // the breakdown is the only panel in the right column and stretches to the
+  // sessions list beside it, so the chart takes whatever height is left over.
+  //
+  // Measured against the *viewport*, never against any ancestor's current
+  // height. Every box between here and <main> is content-sized — each one is as
+  // tall as the SVG the last render drew — so subtracting siblings from a
+  // parent's height returns "the old chart plus slack" and the chart grows by
+  // that slack on every single render. The viewport is the one height in this
+  // chain that a render cannot change.
+  const used = [...host.parentElement.children]
+    .filter((c) => c !== host)
+    .reduce((a, c) => a + c.getBoundingClientRect().height, 0);
+  // The card is capped at calc(100vh - 32px) by the wide layout; the rest is
+  // its own chrome (padding + the summary row). Constants rather than measured
+  // offsets, so scrolling the page cannot change the chart's height.
+  const H = Math.max(Math.floor(innerHeight - 32 - 62 - used), 420);
+  host.style.setProperty('--detail-chart-h', `${H}px`);
   // Right margin holds the cumulative-cost axis labels.
   const m = { top: 16, right: 56, bottom: 30, left: costMode ? 68 : 62 };
   const plotW = W - m.left - m.right;
@@ -1274,12 +1194,11 @@ function renderSessionDetail(session, events) {
   // you can still see where one turn ends and the next begins.
   //
   // Note this trades away accuracy at the *other* end: 2px is a growing share
-  // of a shrinking band, so past ~150 calls the fill drops below the 70% the
-  // old rule held, reaching ~34% as bars approach BAR_MODE_MAX_CALLS. Capping
-  // the gap at a fraction of the band (`Math.min(2, band * 0.15)`) would hold
-  // 2px everywhere it is legible and taper below that.
-  const useBars = points.length < BAR_MODE_MAX_CALLS;
+  // of a shrinking band, so as the band narrows the fill drops below the 70%
+  // the old rule held. MIN_BAR_BAND_PX bounds that: bar mode ends once the gap
+  // would cost more than 2/5 of the band.
   const band = plotW / points.length;
+  const useBars = band >= MIN_BAR_BAND_PX;
   const BAR_GAP = 2;
   const barW = Math.max(1, band - BAR_GAP);
   const x = useBars
@@ -1289,7 +1208,10 @@ function renderSessionDetail(session, events) {
   // drawing outside the chart area.
   const y = (v) => m.top + plotH - (Math.min(v, top) / top) * plotH;
 
-  const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, height: H });
+  // No `height` attribute: the CSS sizes the SVG to its host, and setting the
+  // height here would make the host's own clientHeight — which H is measured
+  // from — a function of the last render rather than of the space available.
+  const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
 
   // Cumulative cost rides on a second scale, drawn against the *same* gridlines
   // as the left axis. Giving it its own nice-tick set would put a second family
@@ -1817,11 +1739,11 @@ function renderSessionDetail(session, events) {
 
   setChildren(host, svg);
 
-  // The swatch on the plot now carries the unit and its value, so this line is
-  // left with only what a square cannot show: how to count it. Bar mode draws
-  // columns at 70% of their band, so the *ink* is 70% of the area it represents
-  // and a naive count runs ~30% low; only the gapless area mode can be counted
-  // directly.
+  // The swatch on the plot carries the unit and its value, so this line is left
+  // with only the caveat a square cannot show. Bar mode draws columns at 70% of
+  // their band, so the *ink* is 70% of the area it represents and a naive count
+  // runs ~30% low; area mode is gapless and needs no such warning, which is why
+  // the non-usage note disappears entirely there.
   //
   // `gridFits`, not `moneyGrid`: a value is always chosen, but it is only drawn
   // when it fits the plot. Keying the note off the value alone would describe a
@@ -1832,17 +1754,14 @@ function renderSessionDetail(session, events) {
     if (usageMode) {
       gridNote.textContent =
         `Each square is 1% of a 5-hour window (~${compact(moneyGrid.value)} output tokens, ` +
-        `or ~${compact(QUOTA_CACHE_WRITE_TOKENS_PER_PERCENT)} cache-write tokens) — ` +
-        (useBars
-          ? 'measured per column band, not the drawn bar width. '
-          : 'count the squares under the curve. ') +
-        'Output plus cache write; cache reads are not metered. ' +
-        'Dashed lines mark compactions — their cost lands on the following call. ' +
+        `or ~${compact(QUOTA_CACHE_WRITE_TOKENS_PER_PERCENT)} cache-write tokens)` +
+        (useBars ? ' — measured per column band, not the drawn bar width. ' : '. ') +
         quotaCalibrationNote(points);
     } else {
       gridNote.textContent = useBars
-        ? 'Each square is one unit of spend — measured per column band, not the drawn bar width.'
-        : 'Each square is one unit of spend — count the squares under the curve.';
+        ? 'Measured per column band, not the drawn bar width.'
+        : '';
+      gridNote.hidden = !useBars;
     }
   }
 
@@ -1930,12 +1849,18 @@ function renderSessionDetail(session, events) {
 let stats = null;
 let sessions = [];
 let selectedId = null;
-// 'cost' (money per turn) | 'absolute' (tokens per turn). Cost is the default:
-// cache read is a median ~99% of every turn, so on the token axis the other
-// three bands are sub-pixel and the chart opens on a view where nothing but
-// cache read is legible. Weighting by $/token lifts the thin-but-expensive
-// bands into view, so the first thing shown is where the money went.
-let detailMode = 'cost';
+// 'usage' (quota per turn) | 'cost' (money per turn) | 'absolute' (tokens per
+// turn). Not 'absolute': cache read is a median ~99% of every turn, so on the
+// raw token axis the other three bands are sub-pixel and the chart opens on a
+// view where nothing but cache read is legible. Both weighted modes fix that by
+// scaling the bands by what they actually consume.
+//
+// Usage over cost because the quota window is the binding constraint in
+// practice — it is what stops a session, whereas the dollar figure is a number
+// you note afterwards. It also drops cache reads entirely (they are unmetered),
+// so the opening view is the one where the dominant band is not just scaled
+// down but correctly absent.
+let detailMode = 'usage';
 // Horizontal zoom over the session chart, as a half-open index range into the
 // call list — not a pixel transform. Keeping it in call space means the
 // bar/area threshold, the tooltips and the compaction markers all keep working
@@ -1951,7 +1876,7 @@ function renderSessions() {
     '<th class="num">Context</th><th class="num">Cost</th>' +
     '<th class="num" title="Output plus cache write, in percent of a 5-hour ' +
     'window. A long session straddles window resets, so this can exceed 100%.">' +
-    'Percent of 5-hour window</th>' +
+    '% 5hr.<br>window</th>' +
     '<th>Cache TTL</th><th>Last active</th></tr></thead><tbody>' +
     rows.map((s) => {
       const name = s.title || s.sessionId.slice(0, 8);
@@ -2014,33 +1939,11 @@ const panelOpen = (id) => {
 // render it themselves from freshly fetched events — otherwise a refresh draws
 // it twice, the first time from the stale cached payload.
 function renderAll({ detail = true } = {}) {
-  if (panelOpen('daily')) renderDaily(stats.daily);
   // The session breakdown rides along here so resize and theme changes re-lay
   // it out; it draws from the cached session payload, not from `stats`.
   if (detail && detailData && panelOpen('detail-chart')) {
     renderSessionDetail(detailData.session, detailData.events);
   }
-
-  if (panelOpen('models')) renderBars('models', 'models-table', stats.models, {
-    value: (m) => m.cost,
-    label: (m) => m.label,
-    display: (m) => fmtUSD(m.cost),
-    tip: (m) => [
-      ['Cost', fmtUSD(m.cost)],
-      ['Calls', fmtInt(m.calls)],
-      ['Output', compact(m.outputTokens) + ' tok'],
-      ['Cache read', compact(m.cacheReadTokens) + ' tok'],
-    ],
-    table: (rows) =>
-      '<thead><tr><th>Model</th><th class="num">Calls</th><th class="num">Output</th>' +
-      '<th class="num">Cache read</th><th class="num">Cost</th></tr></thead><tbody>' +
-      rows.map((m) =>
-        `<tr><td>${m.label}</td><td class="num">${fmtInt(m.calls)}</td>` +
-        `<td class="num">${fmtInt(m.outputTokens)}</td>` +
-        `<td class="num">${fmtInt(m.cacheReadTokens)}</td>` +
-        `<td class="num">${fmtUSD(m.cost)}</td></tr>`).join('') +
-      '</tbody>',
-  });
 
   renderSessions();
 }
@@ -2155,6 +2058,28 @@ el('theme-toggle').addEventListener('click', () => {
 });
 
 addEventListener('resize', () => { if (stats) renderAll(); });
+
+// The chart is laid out for the height its host resolves to, but on the wide
+// layout that height comes from the flex box *around* the SVG — so it isn't
+// known until after a render has already happened. Watching the host closes
+// the loop: opening the panel, collapsing a sibling, or any reflow that
+// changes the leftover space redraws at the new size. Guarded on an actual
+// change, since re-rendering is what resizes the host and would otherwise
+// re-trigger this observer forever.
+if (window.ResizeObserver) {
+  // Observes the *card*, never the chart: the card's height comes from the grid
+  // row, while the chart's comes from the SVG a render just drew. Watching the
+  // chart would make every redraw retrigger the observer, and since each pass
+  // re-measures the slack it would ratchet taller forever.
+  const card = el('detail-card');
+  let lastH = card.clientHeight;
+  new ResizeObserver(() => {
+    const h = card.clientHeight;
+    if (Math.abs(h - lastH) < 1) return;
+    lastH = h;
+    if (detailData) renderSessionDetail(detailData.session, detailData.events);
+  }).observe(card);
+}
 
 refresh().then(connect).catch(() => setLive(false, 'watcher unreachable'));
 </script>
