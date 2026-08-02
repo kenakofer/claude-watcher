@@ -100,11 +100,27 @@ different from the other two, and all are load-bearing:
   to every per-call total elsewhere in the file; omitting it under-counts badly.
   In practice compactions are ~15% of a long session's quota across a handful of
   events, because a summary is pure generation.
-- **It never clips.** Cost mode clips at ~p98 and that is fine there, because a
-  clipped bar still reads as "off the top" on a rate axis. Here area *is* the
-  quantity, so clipping would silently destroy it. An oversized compaction is
-  instead drawn wider and proportionally shorter (`spreadFor`), which preserves
-  area exactly. If you need to tame a tall bar, widen it — never cut it.
+- **It never clips silently.** Cost mode clips at ~p98 and that is fine there,
+  because a clipped bar still reads as "off the top" on a rate axis. Here area
+  *is* the quantity, so clipping would destroy it. An oversized compaction is
+  instead drawn wider and proportionally shorter (`spreadFor`), preserving area.
+  If you need to tame a tall bar, widen it — never cut it.
+
+  The widening is capped at 4 bands, and on real data that cap binds: a median
+  compaction wants ×5–×9. A capped bar therefore *does* under-draw its area, so
+  it is hatched, counted in the grid note, and reports its true percentage in
+  the tooltip. That disclosure is the load-bearing part — if you change the cap
+  or the geometry, keep it. An under-drawn bar that looks ordinary is the exact
+  failure this mode exists to avoid.
+
+The unit is **measured on Opus 5 only** (`QUOTA_CALIBRATION_MODEL`). Sessions
+that ran mostly on another model get an explicit warning in the grid note rather
+than silently borrowing the figure. Whether the constant is per-model is an open
+question the data cannot settle: if the meter counts raw output tokens it is
+universal, and if it counts cost in output-equivalents a cheaper model should
+consume more slowly. Resolve it by fitting a window of substantial Sonnet
+traffic the same way — landing near 2,428 means raw tokens, ~5× higher means
+cost.
 
 Note this differs from the Copilot-era chart it's modeled on, which summed
 cumulatively — there, compaction was a slope change. Here the stack is per-call,

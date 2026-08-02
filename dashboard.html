@@ -462,7 +462,54 @@ const STACK = [
 // Compaction needs NO separate term. Across the one compaction in the clean
 // window the model's residual *improved* (-3.40 -> -0.81 points): the meter did
 // not jump. Compaction is billed as input, and input is not what is metered.
+// It is still quota-heavy per event, because generating a ~10k-token summary is
+// ~30x a median turn's output.
+//
+// MEASURED ON OPUS 5 ONLY. Every window in the sample was Opus traffic, so this
+// constant is really "per Opus output token" and the mode says so. Two ways it
+// could differ elsewhere, which the data cannot distinguish:
+//
+//  - If the meter counts raw output tokens, this constant is universal.
+//  - If it counts *cost* denominated in output-equivalents, cheaper models
+//    should consume more slowly (Opus output is ~5x Sonnet), and on a model with
+//    a different input:output price ratio the input term may stop being
+//    negligible — the claim "input does not count" was verified only where
+//    input is 94-99.5% cache read at Opus rates.
+//
+// To settle it: run a window with substantial Sonnet traffic and fit the same
+// way (low range, extrapolate high). Landing near 2,428 means raw tokens;
+// landing ~5x higher means cost.
 const QUOTA_OUTPUT_TOKENS_PER_PERCENT = 2_428;
+
+// The model the constant was calibrated against. Shown wherever the unit is,
+// so a Sonnet session does not silently inherit an Opus-derived figure.
+const QUOTA_CALIBRATION_MODEL = 'claude-opus-5';
+
+const QUOTA_CALIBRATION_LABEL = 'Opus 5';
+
+// Names the calibration, and warns when the session being plotted did not run
+// on it. A quiet "calibrated on Opus 5" is enough when that is what you ran;
+// when it is not, the reader needs to know the numbers are borrowed rather than
+// measured. Keyed on the model that produced most of the session's output,
+// since that is the model the figure is most wrong about. Labels come from the
+// events (`modelLabel`), which is where the dashboard gets every other model
+// name — the raw id is only used for the equality test.
+function quotaCalibrationNote(pts) {
+  const byModel = {};
+  for (const p of pts) {
+    if (p.compaction || !p.e.model) continue;
+    const b = byModel[p.e.model] || { tokens: 0, label: p.e.modelLabel || p.e.model };
+    b.tokens += p.usageTotal;
+    byModel[p.e.model] = b;
+  }
+  const ranked = Object.entries(byModel).sort((a, b) => b[1].tokens - a[1].tokens);
+  if (!ranked.length || ranked[0][0] === QUOTA_CALIBRATION_MODEL) {
+    return `Calibrated on ${QUOTA_CALIBRATION_LABEL}.`;
+  }
+  return `Calibrated on ${QUOTA_CALIBRATION_LABEL}, but this session ran mostly on `
+    + `${ranked[0][1].label} — the per-percent unit has not been measured there, `
+    + 'so treat these percentages as indicative only.';
+}
 
 // Usage mode plots output tokens only — not the full stack the token view
 // shows. A cache read is pushed through the model but does not move the 5-hour
@@ -940,10 +987,26 @@ function renderSessionDetail(session, events) {
     : 1;
   // Widen only as far as needed to bring a compaction near the ordinary peak,
   // capped so a bar never becomes an unreadable smear across the plot.
-  const spreadFor = (p) => {
+  //
+  // A median compaction generates ~9.7k output tokens against a p98 turn's
+  // ~1.5k, so this routinely wants x6 or more and the cap binds. That is a real
+  // tension: spreading is area-preserving only while the requested width is
+  // granted, so a capped bar under-draws its area — the one thing this mode
+  // promises not to do. The cap wins anyway (a 7-band bar buries its
+  // neighbours), and the shortfall is disclosed instead of hidden: capped bars
+  // are hatched, counted in the legend, and report their true percentage in the
+  // tooltip. Silent under-drawing is what we are avoiding, not under-drawing.
+  const SPREAD_CAP = 4;
+  const spreadWanted = (p) => {
     if (!p.compaction || !usageTypical) return 1;
-    return Math.min(4, Math.max(1, Math.round(p.usageTotal / usageTypical)));
+    return Math.max(1, Math.round(p.usageTotal / usageTypical));
   };
+  const spreadFor = (p) => Math.min(SPREAD_CAP, spreadWanted(p));
+  const spreadCapped = (p) => spreadWanted(p) > SPREAD_CAP;
+  // The ceiling is set by what is actually drawn. Capped bars are allowed to
+  // exceed it and are clamped by y() — they are already flagged as capped, so a
+  // taller-than-axis bar reads as "this one is off the scale" rather than as a
+  // quiet inaccuracy.
   const usageMax = Math.max(
     ...points.map((p) => p.usageTotal / spreadFor(p)),
     1,
@@ -1274,9 +1337,29 @@ function renderSessionDetail(session, events) {
   // property worth protecting — clipping the height would have made the bar
   // legible by lying about how much it cost.
   if (usageMode) {
+    // Hatch for bars whose spread hit the cap: their drawn area understates the
+    // real quantity, so they must not read as ordinary rectangles.
+    const defs = svgEl('defs', {});
+    const hatch = svgEl('pattern', {
+      id: 'usage-capped',
+      width: 6,
+      height: 6,
+      patternUnits: 'userSpaceOnUse',
+      patternTransform: 'rotate(45)',
+    });
+    hatch.appendChild(svgEl('rect', {
+      width: 6, height: 6, fill: 'var(--critical)', 'fill-opacity': 0.35,
+    }));
+    hatch.appendChild(svgEl('rect', {
+      width: 2, height: 6, fill: 'var(--critical)', 'fill-opacity': 0.9,
+    }));
+    defs.appendChild(hatch);
+    svg.appendChild(defs);
+
     points.forEach((p, i) => {
       if (!p.compaction || p.usageTotal <= 0) return;
       const spread = spreadFor(p);
+      const capped = spreadCapped(p);
       const w = useBars ? Math.max(barW * spread, 3) : Math.max(band * spread, 3);
       const h = plotH * Math.min(1, p.usageTotal / spread / top);
       svg.appendChild(svgEl('rect', {
@@ -1284,8 +1367,8 @@ function renderSessionDetail(session, events) {
         y: m.top + plotH - h,
         width: w,
         height: h,
-        fill: 'var(--critical)',
-        'fill-opacity': 0.55,
+        fill: capped ? 'url(#usage-capped)' : 'var(--critical)',
+        'fill-opacity': capped ? 1 : 0.55,
         stroke: 'var(--critical)',
         'stroke-width': 1,
       }));
@@ -1440,7 +1523,8 @@ function renderSessionDetail(session, events) {
         ['Event', 'Compaction' + (p.e.trigger ? ` (${p.e.trigger})` : '')],
         ['Context summarized', fmtInt(p.e.preTokens || 0) + ' tok (input — not metered)'],
         ['Summary produced', fmtInt(p.e.postTokens || 0) + ' tok (output)'],
-        ['Quota', pctOf(p.usageTotal)],
+        ['Quota', pctOf(p.usageTotal)
+          + (spreadCapped(p) ? ' — bar drawn short, see hatching' : '')],
         ['Used so far', pctOf(p.cumUsage)],
       ];
     }
@@ -1597,6 +1681,7 @@ function renderSessionDetail(session, events) {
   // `gridFits`, not `moneyGrid`: a value is always chosen, but it is only drawn
   // when it fits the plot. Keying the note off the value alone would describe a
   // square that is nowhere on screen.
+  const cappedCount = usageMode ? points.filter((p) => p.compaction && spreadCapped(p)).length : 0;
   const gridNote = el('detail-grid-note');
   gridNote.hidden = !gridFits;
   if (gridFits) {
@@ -1606,7 +1691,12 @@ function renderSessionDetail(session, events) {
         (useBars
           ? 'measured per column band, not the drawn bar width. '
           : 'count the squares under the curve. ') +
-        'Output only: the 5-hour meter tracks generation, so cache reads are excluded.';
+        'Output only: the 5-hour meter tracks generation, so cache reads are excluded. ' +
+        (cappedCount
+          ? `${cappedCount} compaction${cappedCount === 1 ? '' : 's'} hatched — too tall to `
+            + 'draw to scale, so the bar understates it; the tooltip has the real figure. '
+          : '') +
+        quotaCalibrationNote(points);
     } else {
       gridNote.textContent = useBars
         ? 'Each square is one unit of spend — measured per column band, not the drawn bar width.'
@@ -1764,6 +1854,7 @@ function renderQuota(session, events) {
     `Estimated: 1 square ≈ ${compact(QUOTA_SQUARE_TOKENS)} output tokens, from a ` +
     `${compact(WINDOW_OUTPUT_TOKENS)}-output-token window measured against known ` +
     'window boundaries. The meter tracks generation, so cache reads are excluded. ' +
+    `Calibrated on ${QUOTA_CALIBRATION_LABEL}. ` +
     'Counts this session only, over the trailing 5 hours' +
     (excluded ? ` (${fmtInt(excluded)} earlier calls excluded).` : '.');
 
