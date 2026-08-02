@@ -629,6 +629,80 @@ function svgEl(tag, attrs = {}) {
   return node;
 }
 
+// --- Stable updates ---------------------------------------------------------
+//
+// A live SSE batch re-renders everything, which used to shove the page around
+// under anyone reading it. Two separate causes, one helper each.
+//
+// 1. Emptying a chart host before refilling it collapses the element to zero
+//    height for the duration. The document shrinks, the browser clamps
+//    scrollTop to the new maximum, and refilling does NOT restore it — so the
+//    page creeps upward on every update. Swapping the content in a single
+//    replaceChildren() never yields a zero-height intermediate state.
+//
+// 2. Replacing a table's innerHTML resets the horizontal scroll of its `.scroll`
+//    container, throwing away a sideways scroll mid-read.
+//
+// The vertical position also has to survive genuine height changes — a new
+// model bar, a new session row — which no swap can avoid. `preserveScroll`
+// pins the viewport against the document's own growth above it.
+
+// Replace a host's children in one operation, so it is never transiently empty.
+const setChildren = (host, ...nodes) => host.replaceChildren(...nodes);
+
+// The empty-state paragraph every chart falls back to, as a node rather than a
+// string so it can go through the same single-swap path.
+const emptyNote = (text) => {
+  const p = document.createElement('p');
+  p.className = 'empty';
+  p.textContent = text;
+  return p;
+};
+
+// Set a table's HTML while keeping its horizontal scroll offset.
+function setTableHTML(table, html) {
+  const box = table.closest('.scroll');
+  const left = box ? box.scrollLeft : 0;
+  table.innerHTML = html;
+  // Restore only when it can still be honoured; a table that got narrower
+  // clamps on its own rather than snapping to a stale offset.
+  if (box && left) box.scrollLeft = Math.min(left, box.scrollWidth - box.clientWidth);
+}
+
+// Run a re-render that may change the document's height, holding the viewport
+// still relative to the content the user is looking at.
+//
+// Anchored on the first element still visible at the top of the viewport rather
+// than on scrollY: content growing *above* the anchor (a new session row, a new
+// model bar) would otherwise push everything below it down by that height. The
+// anchor moves with its content, so the correction is exactly the drift.
+function preserveScroll(render) {
+  // Nothing to preserve at the very top, and holding position there would fight
+  // the natural "stay at the top" reading of a live feed.
+  if (scrollY <= 0) { render(); return; }
+  // Panels alone are too coarse: inside a tall one, the panel's own top edge is
+  // far above the viewport and cannot report drift. Table rows carry a stable
+  // identity across re-renders, so they anchor the inside of a panel too.
+  const anchors = document.querySelectorAll('main > .panel, tr[data-id]');
+  let anchor = null;
+  for (const node of anchors) {
+    const top = node.getBoundingClientRect().top;
+    // First element whose top edge is at or below the viewport top.
+    if (top >= 0) { anchor = { node, top, id: node.dataset && node.dataset.id }; break; }
+  }
+  render();
+  if (!anchor) return;
+  // A row anchor is replaced wholesale by innerHTML, so re-find it by id; a
+  // panel is the same node throughout. If the anchor is gone entirely (its
+  // session dropped out of the list) there is no meaningful correction.
+  const after = anchor.id
+    ? document.querySelector(`tr[data-id="${CSS.escape(anchor.id)}"]`)
+    : anchor.node;
+  if (!after) return;
+  const delta = after.getBoundingClientRect().top - anchor.top;
+  if (delta) scrollBy(0, delta);
+}
+
 // Ticks at round intervals covering [0, max].
 //
 // `cover` extends the top tick to at or above `max`, so the axis actually
@@ -650,8 +724,12 @@ function niceTicks(max, count = 4, cover = false) {
 // --- Stacked column chart: spend per day ------------------------------------
 function renderDaily(daily) {
   const host = el('daily');
-  host.innerHTML = '';
-  if (!daily.length) { host.innerHTML = '<p class="empty">No priced calls yet.</p>'; return; }
+  // No pre-clear: the host keeps its old contents (and so its width, which is
+  // measured below) until the finished chart replaces them in one swap.
+  if (!daily.length) {
+    setChildren(host, emptyNote('No priced calls yet.'));
+    return;
+  }
 
   const days = daily.slice(-30);
   const W = Math.max(host.clientWidth || 720, 320);
@@ -729,13 +807,13 @@ function renderDaily(daily) {
     class: 'axis-line', x1: m.left, x2: m.left + plotW,
     y1: m.top + plotH, y2: m.top + plotH,
   }));
-  host.appendChild(svg);
+  setChildren(host, svg);
 
   el('daily-legend').innerHTML = SERIES.map(
     (s) => `<span class="item"><span class="swatch" style="background:${s.color}"></span>${s.label}</span>`,
   ).join('');
 
-  el('daily-table').innerHTML =
+  setTableHTML(el('daily-table'),
     '<thead><tr><th>Day</th>' +
     SERIES.map((s) => `<th class="num">${s.label}</th>`).join('') +
     '<th class="num">Total</th><th class="num">Calls</th></tr></thead><tbody>' +
@@ -744,14 +822,13 @@ function renderDaily(daily) {
       SERIES.map((s) => `<td class="num">${fmtUSD(d[s.key] || 0)}</td>`).join('') +
       `<td class="num">${fmtUSD(d.cost)}</td><td class="num">${fmtInt(d.calls)}</td></tr>`,
     ).join('') +
-    '</tbody>';
+    '</tbody>');
 }
 
 // --- Horizontal bars: one series, one color --------------------------------
 function renderBars(hostId, tableId, rows, opts) {
   const host = el(hostId);
-  host.innerHTML = '';
-  if (!rows.length) { host.innerHTML = '<p class="empty">Nothing recorded yet.</p>'; return; }
+  if (!rows.length) { setChildren(host, emptyNote('Nothing recorded yet.')); return; }
 
   const items = rows.slice(0, opts.limit || 8);
   const rowH = 30;
@@ -792,8 +869,8 @@ function renderBars(hostId, tableId, rows, opts) {
     svg.appendChild(hit);
   });
 
-  host.appendChild(svg);
-  el(tableId).innerHTML = opts.table(rows);
+  setChildren(host, svg);
+  setTableHTML(el(tableId), opts.table(rows));
 }
 
 // Below this many calls, the session breakdown is drawn as discrete stacked
@@ -877,13 +954,12 @@ function renderSessionDetail(session, events) {
     .filter((e) => e.kind === 'chat_completion' && e.timestamp)
     .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
   const host = el('detail-chart');
-  host.innerHTML = '';
   // The note outlives the chart it describes, so this path has to clear it
   // explicitly — otherwise the previous session's grid square is left pointing
   // at an empty panel.
   if (!calls.length) {
     el('detail-grid-note').hidden = true;
-    host.innerHTML = '<p class="empty">No model calls in this session.</p>';
+    setChildren(host, emptyNote('No model calls in this session.'));
     return;
   }
 
@@ -1711,7 +1787,7 @@ function renderSessionDetail(session, events) {
     });
   }
 
-  host.appendChild(svg);
+  setChildren(host, svg);
 
   // The swatch on the plot now carries the unit and its value, so this line is
   // left with only what a square cannot show: how to count it. Bar mode draws
@@ -1786,7 +1862,7 @@ function renderSessionDetail(session, events) {
   el('detail-table-label').textContent = detailZoom
     ? `Table view — model calls (last ${shown} of ${fmtInt(points.length)} in view)`
     : `Table view — model calls (last ${shown})`;
-  el('detail-table').innerHTML =
+  setTableHTML(el('detail-table'),
     '<thead><tr><th class="num">#</th><th>Time</th><th>Model</th>' +
     cols.map((s) => `<th class="num">${s.label}</th>`).join('') +
     (costMode
@@ -1819,7 +1895,7 @@ function renderSessionDetail(session, events) {
             `<td class="num">${fmtExactUSD((p.e.cost && p.e.cost.total) || 0)}</td>`) +
       '</tr>',
     ).join('') +
-    '</tbody>';
+    '</tbody>');
 }
 
 // --- Quota weight: the session measured against a 5-hour window -------------
@@ -1859,7 +1935,6 @@ const quotaTokensOf = (u) =>
 
 function renderQuota(session, events) {
   const host = el('quota-chart');
-  host.innerHTML = '';
   const all = events
     .filter((e) => e.kind === 'chat_completion' && e.timestamp)
     .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
@@ -1874,8 +1949,8 @@ function renderQuota(session, events) {
     el('quota-total').textContent = '';
     el('quota-note').textContent = '';
     el('quota-legend').innerHTML = '';
-    el('quota-table').innerHTML = '';
-    host.innerHTML = '<p class="empty">No model calls in this session.</p>';
+    setTableHTML(el('quota-table'), '');
+    setChildren(host, emptyNote('No model calls in this session.'));
     return;
   }
 
@@ -1976,7 +2051,7 @@ function renderQuota(session, events) {
   hit.addEventListener('mouseleave', hideTip);
   svg.appendChild(hit);
 
-  host.appendChild(svg);
+  setChildren(host, svg);
 
   el('quota-legend').innerHTML =
     `<span class="item"><span class="swatch" style="background:var(--quota)"></span>` +
@@ -1985,7 +2060,7 @@ function renderQuota(session, events) {
   // Last 40 calls, matching the session table above, with the running share so
   // the squares are readable as numbers too.
   const shown = points.slice(-40);
-  el('quota-table').innerHTML =
+  setTableHTML(el('quota-table'),
     '<thead><tr><th class="num">#</th><th>Time</th><th>Model</th>' +
     '<th class="num">Tokens</th><th class="num">Cumulative</th><th class="num">Window %</th>' +
     '</tr></thead><tbody>' +
@@ -1996,7 +2071,7 @@ function renderQuota(session, events) {
       `<td class="num">${fmtInt(p.cum)}</td>` +
       `<td class="num">${p.pct.toFixed(2)}%</td></tr>`,
     ).join('') +
-    '</tbody>';
+    '</tbody>');
 }
 
 // --- Data plumbing ----------------------------------------------------------
@@ -2019,7 +2094,7 @@ let detailData = null;       // last-rendered session payload, for re-render on 
 
 function renderSessions() {
   const rows = sessions.slice(0, 60);
-  el('sessions-table').innerHTML =
+  setTableHTML(el('sessions-table'),
     '<thead><tr><th>Session</th><th>Project</th><th class="num">Calls</th>' +
     '<th class="num">Context</th><th class="num">Cost</th><th>Cache TTL</th>' +
     '<th>Last active</th></tr></thead><tbody>' +
@@ -2044,7 +2119,7 @@ function renderSessions() {
         <td class="muted">${when}</td>
       </tr>`;
     }).join('') +
-    '</tbody>';
+    '</tbody>');
 
   for (const tr of el('sessions-table').querySelectorAll('tr[data-id]')) {
     tr.style.cursor = 'pointer';
@@ -2121,13 +2196,17 @@ async function refresh() {
     if (first) selectedId = first.sessionId;
   }
 
-  renderAll();
+  // Two renders with a fetch between them, so each is anchored separately —
+  // measuring across the await would compare against a layout that a paint has
+  // already invalidated. `preserveScroll` is a no-op at the top of the page,
+  // which is where a passive viewer usually sits.
+  preserveScroll(renderAll);
 
   if (selectedId) {
     const res = await fetch(`/api/sessions/${encodeURIComponent(selectedId)}`);
     if (res.ok) {
       const data = await res.json();
-      renderSessionDetail(data.session, data.events);
+      preserveScroll(() => renderSessionDetail(data.session, data.events));
     }
   }
 }
