@@ -895,6 +895,27 @@ function detailCallCount() {
   return detailData.events.filter((e) => e.kind === 'chat_completion' && e.timestamp).length;
 }
 
+// The session total, moved out of the descriptive line and into the headline so
+// it isn't the one number you have to read a sentence to find. It stays
+// labelled because a bare figure at this size could be read as a rate or a
+// budget rather than what this session has spent.
+//
+// Usage mode reports the whole session's quota draw, in the same unit as the
+// chart below it. That can exceed 100%: a long session straddles window resets,
+// and where those boundaries fall is not in the transcript. So the label says
+// "across the session" rather than implying a single window — the honest
+// reading is "this much of a window's worth of quota", not "this fraction of
+// your current limit".
+//
+// `usageEquiv` is in output-token equivalents, which only the caller that has
+// weighted every call can supply.
+function setHeadline(session, usageEquiv) {
+  el('detail-total').innerHTML = detailMode === 'usage'
+    ? `${(usageEquiv / QUOTA_OUTPUT_TOKENS_PER_PERCENT).toFixed(1)}%` +
+      '<span class="headline-label">of a 5-hour window, across the session</span>'
+    : `${fmtUSD(session.totals.cost)}<span class="headline-label">session total</span>`;
+}
+
 // --- Stacked columns / area: context window over a session ------------------
 function renderSessionDetail(session, events) {
   detailData = { session, events };
@@ -918,12 +939,8 @@ function renderSessionDetail(session, events) {
       : detailMode === 'usage'
         ? ' — percent of the 5-hour window per turn; only output and cache write are metered.'
         : ' — tokens per turn, stacked; the stack height is the context window.');
-  // The total moves out of the descriptive line and into the headline, so it
-  // isn't the one number you have to read a sentence to find. It stays labelled
-  // because a bare dollar figure at this size could be read as a rate or a
-  // budget rather than what this session has cost.
-  el('detail-total').innerHTML =
-    `${fmtUSD(session.totals.cost)}<span class="headline-label">session total</span>`;
+  // The headline is set once the points are built, below: in usage mode it
+  // reports quota, which is only known after every call has been weighted.
 
   // Sort by timestamp rather than trusting ingest order. A resumed session's
   // transcript can append entries out of chronological order (and subagent
@@ -939,6 +956,10 @@ function renderSessionDetail(session, events) {
   if (!calls.length) {
     el('detail-grid-note').hidden = true;
     setChildren(host, emptyNote('No model calls in this session.'));
+    // The headline is normally set once the points are weighted, which this
+    // path never reaches — without this it would keep displaying the previously
+    // selected session's total next to an empty chart.
+    setHeadline(session, 0);
     return;
   }
 
@@ -1035,6 +1056,8 @@ function renderSessionDetail(session, events) {
       e,
     };
   });
+
+  setHeadline(session, runningUsage);
 
   // The zoom window is re-clamped against this session's length on every
   // render, so a stale range from a longer session (or one invalidated by new
@@ -1899,8 +1922,11 @@ function renderSessions() {
   const rows = sessions.slice(0, 60);
   setTableHTML(el('sessions-table'),
     '<thead><tr><th>Session</th><th>Project</th><th class="num">Calls</th>' +
-    '<th class="num">Context</th><th class="num">Cost</th><th>Cache TTL</th>' +
-    '<th>Last active</th></tr></thead><tbody>' +
+    '<th class="num">Context</th><th class="num">Cost</th>' +
+    '<th class="num" title="Output plus cache write, in percent of a 5-hour ' +
+    'window. A long session straddles window resets, so this can exceed 100%.">' +
+    'Percent of 5-hour window</th>' +
+    '<th>Cache TTL</th><th>Last active</th></tr></thead><tbody>' +
     rows.map((s) => {
       const name = s.title || s.sessionId.slice(0, 8);
       const when = s.lastTimestamp ? new Date(s.lastTimestamp).toLocaleString() : '—';
@@ -1912,12 +1938,17 @@ function renderSessions() {
       const ttlCell = ttl.kind === 'none'
         ? '<span class="muted">—</span>'
         : `<span class="pill ttl-${ttl.kind}">${ttl.label}</span>`;
+      // Same unit and weights as the usage chart's headline, computed from the
+      // session totals rather than per call — the sum is identical either way.
+      const usagePct = quotaEquivOf(s.totals.outputTokens, s.totals.cacheCreationTokens)
+        / QUOTA_OUTPUT_TOKENS_PER_PERCENT;
       return `<tr data-id="${encodeURIComponent(s.sessionId)}" ${s.sessionId === selectedId ? 'class="selected"' : ''}>
         <td class="name">${badge}${name}</td>
         <td class="name muted">${project}</td>
         <td class="num">${fmtInt(s.totals.calls)}</td>
         <td class="num">${s.contextWindow ? compact(s.contextWindow) : '—'}</td>
         <td class="num">${fmtUSD(s.totals.cost)}</td>
+        <td class="num">${s.totals.calls ? usagePct.toFixed(1) + '%' : '—'}</td>
         <td title="${ttl.title}">${ttlCell}</td>
         <td class="muted">${when}</td>
       </tr>`;
