@@ -40,6 +40,12 @@
        compaction is something Claude Code did, while an expiry is just time
        passing — conflating them would imply a causal link that isn't there. */
     --cache-expiry: #0f8f8f;
+    /* Quota squares. Yellow was asked for, but `--series-4` (input) is already
+       amber, so this runs warmer and deeper to stay distinguishable from a
+       token band — the quota panel encodes a budget, not a token type. Light
+       mode darkens it for contrast against the light plane; a true yellow is
+       unreadable there. */
+    --quota: #b8860b;
     --good: #0ca30c;
     --critical: #d03b3b;
   }
@@ -61,6 +67,7 @@
       --cumulative: #a687ea;
       --money-grid: #a687ea;
       --cache-expiry: #2fbdbd;
+      --quota: #f2c14e;
     }
   }
   :root[data-theme="dark"] {
@@ -80,6 +87,7 @@
     --cumulative: #a687ea;
     --money-grid: #a687ea;
     --cache-expiry: #2fbdbd;
+    --quota: #f2c14e;
   }
 
   * { box-sizing: border-box; }
@@ -280,6 +288,7 @@
       <p class="sub grid-note" id="detail-grid-note" hidden></p>
       <div class="modes" id="detail-modes">
         <button class="ghost" type="button" data-mode="absolute">Tokens per turn</button>
+        <button class="ghost" type="button" data-mode="usage">Usage per turn</button>
         <button class="ghost" type="button" data-mode="cost">Cost per turn</button>
         <span class="spacer"></span>
         <span class="zoom-hint" id="detail-zoom-hint"></span>
@@ -292,6 +301,23 @@
       <details>
         <summary class="minor" id="detail-table-label">Table view — model calls (last 40)</summary>
         <div class="scroll"><table id="detail-table"></table></div>
+      </details>
+    </div>
+  </details>
+
+  <details class="card panel" id="quota-card" open>
+    <summary><h2>Quota weight</h2></summary>
+    <div class="panel-body">
+      <div class="detail-head">
+        <p class="sub" id="quota-sub"></p>
+        <p class="headline" id="quota-total"></p>
+      </div>
+      <p class="sub grid-note" id="quota-note"></p>
+      <div id="quota-chart"><p class="empty">Loading…</p></div>
+      <div class="legend" id="quota-legend"></div>
+      <details>
+        <summary class="minor">Table view — cumulative quota by call</summary>
+        <div class="scroll"><table id="quota-table"></table></div>
       </details>
     </div>
   </details>
@@ -351,6 +377,24 @@ const fmtAxisUSD = (n) => {
 // Precise per-call cost for tooltips and tables, where exactness matters more
 // than compactness. fmtUSD rounds sub-cent values to zero.
 const fmtExactUSD = (n) => (n === 0 ? '$0' : '$' + n.toFixed(n < 0.01 ? 5 : 4));
+// Wall-clock time for a single call. Seconds are kept: consecutive calls in a
+// session are often less than a minute apart, so minute precision would show
+// several of them as the same instant.
+const fmtClock = (iso) => {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleTimeString();
+};
+// Time from the first call of the session, which is what makes a timestamp
+// readable as a position in the session rather than a bare time of day.
+const fmtElapsed = (ms) => {
+  if (!Number.isFinite(ms) || ms < 0) return '';
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const mins = Math.floor(s / 60);
+  if (mins < 60) return `${mins}m ${s % 60}s`;
+  const hrs = Math.floor(mins / 60);
+  return `${hrs}h ${mins % 60}m`;
+};
 const compact = (n) => {
   const abs = Math.abs(n);
   if (abs >= 1e9) return (n / 1e9).toFixed(1) + 'B';
@@ -377,6 +421,35 @@ const STACK = [
   { token: 'inputTokens',         cost: 'input',      label: 'Input',       color: 'var(--series-4)' },
   { token: 'outputTokens',        cost: 'output',     label: 'Output',      color: 'var(--series-3)' },
 ];
+
+// --- Quota unit -------------------------------------------------------------
+//
+// Tokens per 1% of a rolling 5-hour window, measured rather than assumed.
+//
+// Derived from a window whose real boundaries were known (the statusline's
+// `rate_limits.resets_at`, which this dashboard cannot see — the figure comes
+// from a separate measurement, not from anything in the transcripts): the meter
+// moved 42% -> 87%, i.e. 45 points, while the transcripts covering that exact
+// span summed to 55.0M tokens across the two sessions that were running.
+//
+// That gives ~1.22M tokens per point, which independently reproduces the
+// earlier `/usage`-calibrated figure of 1.23M to 99.4%. Two unrelated methods
+// agreeing to better than a percent is why this is used as the unit.
+//
+// Deliberately UNWEIGHTED — every token type counts the same. An attempt to fit
+// per-type weights (output 25x, cache write 12.5x, ...) failed validation badly:
+// it was calibrated on per-session meter deltas, but the meter is account-wide,
+// so with two sessions live each delta was driven by both while being charged to
+// one. That inflated the implied per-token cost ~14x. The unweighted sum tracks
+// the meter to ~1%; do not "improve" it with price weights without re-measuring
+// against a whole window with a known reset time.
+const QUOTA_TOKENS_PER_PERCENT = 1_222_502;
+
+// Every token that crosses the model counts, including cache reads: a cache
+// read is ~10x cheaper than fresh input but still has to be pushed through the
+// model, which is what the 5-hour limit meters. This is the same quantity the
+// token stack already plots, so usage mode reuses `total` rather than
+// recomputing it.
 
 // Classify a session by the TTL of its cache writes.
 //
@@ -641,6 +714,10 @@ function detailCallCount() {
 // --- Stacked columns / area: context window over a session ------------------
 function renderSessionDetail(session, events) {
   detailData = { session, events };
+  // The quota panel plots the same session in a different unit, so it follows
+  // this render rather than being wired into every call site separately. It
+  // ignores mode and zoom, so a re-render for either is cheap and idempotent.
+  if (panelOpen('quota-chart')) renderQuota(session, events);
   for (const b of el('detail-modes').querySelectorAll('button[data-mode]')) {
     b.setAttribute('aria-pressed', String(b.dataset.mode === detailMode));
   }
@@ -658,7 +735,9 @@ function renderSessionDetail(session, events) {
     `${fmtInt(session.totals.calls)} calls${ttlNote}` +
     (detailMode === 'cost'
       ? ''
-      : ' — tokens per turn, stacked; the stack height is the context window.');
+      : detailMode === 'usage'
+        ? ' — every token metered by the 5-hour limit, compactions included; area is quota.'
+        : ' — tokens per turn, stacked; the stack height is the context window.');
   // The total moves out of the descriptive line and into the headline, so it
   // isn't the one number you have to read a sentence to find. It stays labelled
   // because a bare dollar figure at this size could be read as a rate or a
@@ -684,28 +763,74 @@ function renderSessionDetail(session, events) {
     return;
   }
 
+  const usageMode = detailMode === 'usage';
+
+  // Compactions as first-class points in usage mode.
+  //
+  // A compaction is billed but has no `usage` record, so it is invisible to
+  // every per-call total in this file. In token and cost mode that is correct —
+  // there is no stack and no priced breakdown to draw. In usage mode it is a
+  // real omission: the summarization call re-reads the whole context, and on a
+  // busy session compactions are a few percent of everything metered.
+  //
+  // The counts come from `compactMetadata` on the boundary event
+  // (`preTokens` = context summarized, `postTokens` = summary produced), which
+  // is the only place they are recorded locally.
+  const compactionPoints = usageMode
+    ? events
+        .filter((e) => e.kind === 'compaction' && e.timestamp && (e.preTokens || e.postTokens))
+        .sort((a, b) => a.timestamp.localeCompare(b.timestamp))
+    : [];
+
   // Each call's four token types, stacked. The stack total is the prompt the
   // model actually saw, so the band inflates turn over turn as context grows
   // and drops hard at a compaction — and because the types are stacked rather
   // than summed into one line, you can also see the composition change there
   // (cache read collapses; cache write spikes as the summary is re-cached).
+  //
+  // Usage mode interleaves compaction bars into the same series, ordered by
+  // timestamp alongside the calls, so the x axis stays chronological and the
+  // cumulative line steps up where the compaction actually happened.
+  const series = usageMode
+    ? [...calls.map((e) => ({ e, compaction: false })),
+       ...compactionPoints.map((e) => ({ e, compaction: true }))]
+        .sort((a, b) => a.e.timestamp.localeCompare(b.e.timestamp))
+    : calls.map((e) => ({ e, compaction: false }));
+
   let running = 0;
-  const allPoints = calls.map((e, i) => {
-    const parts = STACK.map((s) => e.usage[s.token] || 0);
-    const costs = STACK.map((s) => (e.cost && e.cost[s.cost]) || 0);
+  let runningUsage = 0;
+  const allPoints = series.map(({ e, compaction }, i) => {
+    // A compaction has no token-type breakdown, so its bar is a single band in
+    // its own colour rather than a stack. Zero-filling `parts` keeps every
+    // downstream consumer (bars, legend, table, tooltip) on one shape.
+    const parts = compaction
+      ? STACK.map(() => 0)
+      : STACK.map((s) => e.usage[s.token] || 0);
+    const costs = compaction
+      ? STACK.map(() => 0)
+      : STACK.map((s) => (e.cost && e.cost[s.cost]) || 0);
     const costTotal = costs.reduce((a, b) => a + b, 0);
+    const usageTotal = compaction
+      ? (e.preTokens || 0) + (e.postTokens || 0)
+      : parts.reduce((a, b) => a + b, 0);
     // Accumulated from the first call of the session, not the first visible
     // one: "spent so far" is a property of the session, so zooming into a
     // later window must not restart the total at zero.
     running += costTotal;
+    runningUsage += usageTotal;
     return {
       i,
       parts,
       costs,
-      ctx: e.usage.inputTokens + e.usage.cacheReadTokens + e.usage.cacheCreationTokens,
-      total: parts.reduce((a, b) => a + b, 0),
+      compaction,
+      ctx: compaction
+        ? 0
+        : e.usage.inputTokens + e.usage.cacheReadTokens + e.usage.cacheCreationTokens,
+      total: compaction ? 0 : parts.reduce((a, b) => a + b, 0),
+      usageTotal,
       costTotal,
       cum: running,
+      cumUsage: runningUsage,
       e,
     };
   });
@@ -742,6 +867,11 @@ function renderSessionDetail(session, events) {
   //    50x the price of a cache-read token on Opus, so the expensive-but-thin
   //    bands rise into view on their own merits, and the chart answers "where
   //    did the money go" rather than "where did the tokens go".
+  //  - usage: the same token quantity as the token view, but read as *area*
+  //    rather than height, and with compactions added. The 5-hour limit meters
+  //    every token that crosses the model regardless of type, so unlike cost
+  //    mode this one deliberately does not reweight the bands — see
+  //    QUOTA_TOKENS_PER_PERCENT.
   const costMode = detailMode === 'cost';
 
   const W = Math.max(host.clientWidth || 720, 320);
@@ -765,7 +895,42 @@ function renderSessionDetail(session, events) {
   // Headroom so the peak sits below the top gridline instead of against the
   // frame, and `cover` so the top tick is at or above the data — otherwise the
   // highest values get flattened by the y() clamp below.
-  const max = costMode ? costCeiling : Math.max(...points.map((p) => p.total), 1);
+  // Usage does NOT clip. Clipping is right for cost — the y axis there is a
+  // rate and a clipped bar still reads as "off the top" — but usage mode's
+  // contract is that *area is quota*, and a clipped bar silently destroys area.
+  //
+  // A compaction re-reads a whole context in one event, so its bar is routinely
+  // several times the tallest ordinary turn and would flatten everything else.
+  // Instead of cutting the height, spread it sideways: draw the bar `spread`
+  // bands wide at 1/`spread` of the height. Area — and therefore the square
+  // count — is exactly preserved, while the peak comes down to something the
+  // shared axis can hold.
+  const usageValues = points
+    .filter((p) => !p.compaction)
+    .map((p) => p.usageTotal)
+    .sort((a, b) => a - b);
+  // Reference height is the ordinary traffic, not the compactions: that is what
+  // the axis needs to show legibly.
+  const usageTypical = usageValues.length
+    ? usageValues[Math.floor(usageValues.length * 0.98)]
+    : 1;
+  // Widen only as far as needed to bring a compaction near the ordinary peak,
+  // capped so a bar never becomes an unreadable smear across the plot.
+  const spreadFor = (p) => {
+    if (!p.compaction || !usageTypical) return 1;
+    return Math.min(4, Math.max(1, Math.round(p.usageTotal / usageTypical)));
+  };
+  const usageMax = Math.max(
+    ...points.map((p) => p.usageTotal / spreadFor(p)),
+    1,
+  );
+  const usageCeiling = usageMax;
+
+  const max = costMode
+    ? costCeiling
+    : usageMode
+      ? usageCeiling
+      : Math.max(...points.map((p) => p.total), 1);
   // Provisional: sizes the money grid below, and is the final answer in token
   // mode. Cost mode replaces the tick positions once the cell is known, but
   // keeps this `top` so the axis ceiling (and the y() clamp) are unchanged.
@@ -793,6 +958,11 @@ function renderSessionDetail(session, events) {
   // The ladder starts at $1 — no sub-dollar cells. A grid whose unit is $0.001
   // is technically well-sized but practically meaningless: "count the squares"
   // stops being a useful gesture when a square is a tenth of a cent.
+  //
+  // Usage mode uses the identical construction with tokens as the unit. The
+  // ladder there runs over token decades instead of dollar decades, and the
+  // preferred cell is one *percent of a 5-hour window* — the whole point of the
+  // mode is that you can count squares to read quota consumption directly.
   let moneyGrid = null;
   if (costMode) {
     const MONEY_GRID_TARGET_PX = 42;
@@ -804,6 +974,17 @@ function renderSessionDetail(session, events) {
       const score = Math.abs(Math.log(side / MONEY_GRID_TARGET_PX));
       if (!moneyGrid || score < moneyGrid.score) moneyGrid = { value, side, score };
     }
+  } else if (usageMode) {
+    const pxPerCall = plotW / points.length;
+    const pxPerToken = plotH / top;
+    // One rung only: 1% of a window, never a subdivision. Same reasoning as the
+    // money grid's $1 floor — a square worth a tenth of a percent is well-sized
+    // geometrically but useless to count, and "0.1%" reads as noise next to a
+    // meter that only ever reports whole percent. There is no ladder to search,
+    // so no score: if a 1% cell doesn't fit the plot, `gridFits` drops the grid
+    // rather than substituting a unit nobody wants.
+    const value = QUOTA_TOKENS_PER_PERCENT;
+    moneyGrid = { value, side: Math.sqrt(value * pxPerCall * pxPerToken), score: 0, frac: 1 };
   }
 
   // Needs at least ~2 cells on each axis to read as a grid. Without the upper
@@ -859,7 +1040,9 @@ function renderSessionDetail(session, events) {
   // single column. Same reasoning as the cumulative axis below.
   const tickStep = ticks.length > 1 ? ticks[1] - ticks[0] : 0;
   const tickDp = tickStep >= 1 ? 2 : tickStep >= 0.1 ? 2 : tickStep >= 0.01 ? 3 : 4;
-  const fmtLeft = (v) => (ticks === baseTicks ? fmtAxisUSD(v) : '$' + v.toFixed(tickDp));
+  const fmtLeft = usageMode
+    ? (v) => compact(v)
+    : (v) => (ticks === baseTicks ? fmtAxisUSD(v) : '$' + v.toFixed(tickDp));
 
   // Bars sit in evenly divided bands; the area path spans edge to edge so the
   // trend reaches both sides of the plot.
@@ -885,8 +1068,13 @@ function renderSessionDetail(session, events) {
   // running total only climbs, so anchoring at zero would squash the whole
   // visible segment into a sliver at the top whenever the window is late in a
   // long session.
-  const cumLo = points[0].cum - points[0].costTotal;
-  const cumHi = points[points.length - 1].cum;
+  // Usage mode runs the same second scale over cumulative tokens instead of
+  // cumulative dollars, so "how much of the window has this session eaten" is
+  // readable off the right axis exactly as spend is in cost mode.
+  const cumOf = (p) => (usageMode ? p.cumUsage : p.cum);
+  const cumFirstStep = usageMode ? points[0].usageTotal : points[0].costTotal;
+  const cumLo = cumOf(points[0]) - cumFirstStep;
+  const cumHi = cumOf(points[points.length - 1]);
   // Flat window (a zero-cost stretch) would divide by zero; give it a nominal
   // span so the line sits on the baseline instead of vanishing.
   const cumSpan = cumHi - cumLo || 1;
@@ -897,7 +1085,13 @@ function renderSessionDetail(session, events) {
   // has to stay distinguishable, so it sets the decimals.
   const cumStep = cumSpan / (ticks.length - 1 || 1);
   const cumDp = cumStep >= 1 ? 1 : cumStep >= 0.1 ? 2 : cumStep >= 0.01 ? 3 : 4;
-  const fmtCum = (v) => '$' + v.toFixed(cumDp);
+  // Usage labels the cumulative axis in percent of a 5-hour window rather than
+  // raw tokens: the running total is the one number where the quota reading is
+  // the whole point, and "14.2%" answers it directly where "17.4M" needs the
+  // unit applied by hand.
+  const fmtCum = usageMode
+    ? (v) => (v / QUOTA_TOKENS_PER_PERCENT).toFixed(1) + '%'
+    : (v) => '$' + v.toFixed(cumDp);
 
   for (const t of ticks) {
     const gy = y(t);
@@ -944,6 +1138,9 @@ function renderSessionDetail(session, events) {
     // The boundary falls between the previous call and this one, so in bar
     // mode draw it at the leading edge of the band rather than through the
     // middle of a column it didn't split.
+    // In usage mode the compaction is already drawn as its own bar in this
+    // colour, so the marker line would be a second mark for one event.
+    if (usageMode) continue;
     const mx = useBars ? m.left + band * idx : x(idx);
     svg.appendChild(svgEl('line', {
       x1: mx, x2: mx, y1: m.top, y2: m.top + plotH,
@@ -1014,6 +1211,9 @@ function renderSessionDetail(session, events) {
       // with cache read at ~99% of a token-mode stack, the thin bands are only
       // a pixel or two tall and a gap would erase them entirely.
       points.forEach((p, i) => {
+        // Compaction bars are drawn separately below: they have no token-type
+        // breakdown, and their width carries meaning here.
+        if (p.compaction) return;
         if (upper[i] <= lower[i]) return;
         const yTop = y(upper[i]);
         const h = y(lower[i]) - yTop;
@@ -1037,6 +1237,36 @@ function renderSessionDetail(session, events) {
 
     for (let i = 0; i < points.length; i += 1) lower[i] = upper[i];
   });
+
+  // --- Compaction bars (usage mode) -----------------------------------------
+  //
+  // Drawn after the stack so they sit above it, and in their own colour: a
+  // compaction is not a token type, it is a separate billed event that the
+  // per-call stack cannot represent.
+  //
+  // Width, not height, absorbs the size. `spread` widens the bar and divides
+  // its height by the same factor, so the rectangle's AREA is unchanged and the
+  // money-grid squares under it still count the true quantity. That is the
+  // property worth protecting — clipping the height would have made the bar
+  // legible by lying about how much it cost.
+  if (usageMode) {
+    points.forEach((p, i) => {
+      if (!p.compaction || p.usageTotal <= 0) return;
+      const spread = spreadFor(p);
+      const w = useBars ? Math.max(barW * spread, 3) : Math.max(band * spread, 3);
+      const h = plotH * Math.min(1, p.usageTotal / spread / top);
+      svg.appendChild(svgEl('rect', {
+        x: x(i) - w / 2,
+        y: m.top + plotH - h,
+        width: w,
+        height: h,
+        fill: 'var(--critical)',
+        'fill-opacity': 0.55,
+        stroke: 'var(--critical)',
+        'stroke-width': 1,
+      }));
+    });
+  }
 
   // A thin line on the stack's top edge keeps the outline legible where the
   // topmost bands are only a few pixels tall. In token mode that outline is
@@ -1134,7 +1364,9 @@ function renderSessionDetail(session, events) {
       // Value inside the square when it is big enough to hold the text, beside
       // it when it isn't — at the small end of the ladder a centred label would
       // overflow its own cell.
-      const label = `$${moneyGrid.value.toFixed(Math.max(0, -Math.round(Math.log10(moneyGrid.value))))}`;
+      const label = usageMode
+        ? '1%'
+        : `$${moneyGrid.value.toFixed(Math.max(0, -Math.round(Math.log10(moneyGrid.value))))}`;
       const fits = side >= 34;
       const text = svgEl('text', {
         class: 'tick',
@@ -1156,27 +1388,57 @@ function renderSessionDetail(session, events) {
   // In bar mode the points sit at band centres like the columns; in area mode
   // they span edge to edge, matching x() either way.
   const cumPath = points
-    .map((p, i) => `${i ? 'L' : 'M'}${x(i)},${cumY(p.cum)}`)
+    .map((p, i) => `${i ? 'L' : 'M'}${x(i)},${cumY(cumOf(p))}`)
     .join(' ');
   svg.appendChild(svgEl('path', {
     d: cumPath, fill: 'none', stroke: 'var(--cumulative)',
     'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round',
   }));
 
-  const tipRows = (p, idx) => [
-    // Bands top-down, so the tooltip order matches what the eye sees.
-    ...STACK.map((s, si) => [
-      s.label,
+  // Baseline for the elapsed figure: the first call of the session, not of the
+  // zoom window, so a call's offset doesn't change when you zoom into it.
+  const t0 = Date.parse(allPoints[0].e.timestamp);
+
+  const whenRow = (p) => {
+    const t = Date.parse(p.e.timestamp);
+    const gap = Number.isFinite(t0) && Number.isFinite(t) ? fmtElapsed(t - t0) : '';
+    return ['Time', fmtClock(p.e.timestamp) + (gap ? ` · +${gap}` : '')];
+  };
+
+  const pctOf = (v) => (v / QUOTA_TOKENS_PER_PERCENT).toFixed(2) + '% of a 5-hour window';
+
+  const tipRows = (p, idx) => {
+    // A compaction has no token-type stack to describe, so it gets its own rows
+    // rather than four "0 tok" bands.
+    if (p.compaction) {
+      return [
+        whenRow(p),
+        ['Event', 'Compaction' + (p.e.trigger ? ` (${p.e.trigger})` : '')],
+        ['Context summarized', fmtInt(p.e.preTokens || 0) + ' tok'],
+        ['Summary produced', fmtInt(p.e.postTokens || 0) + ' tok'],
+        ['Usage', `${fmtInt(p.usageTotal)} tok · ${pctOf(p.usageTotal)}`],
+        ['Used so far', pctOf(p.cumUsage)],
+      ];
+    }
+    return [
+      whenRow(p),
+      // Bands top-down, so the tooltip order matches what the eye sees.
+      ...STACK.map((s, si) => [
+        s.label,
+        costMode
+          ? `${fmtExactUSD(p.costs[si])} · ${compact(p.parts[si])} tok`
+          : fmtInt(p.parts[si]) + ' tok',
+      ]).reverse(),
       costMode
-        ? `${fmtExactUSD(p.costs[si])} · ${compact(p.parts[si])} tok`
-        : fmtInt(p.parts[si]) + ' tok',
-    ]).reverse(),
-    costMode
-      ? ['Call cost', fmtExactUSD(p.costTotal) + (p.costTotal > costCeiling ? ' (clipped)' : '')]
-      : ['Context window', fmtInt(p.ctx) + ' tok'],
-    ['Spent so far', fmtExactUSD(p.cum)],
-    ['Model', p.e.modelLabel || '—'],
-  ];
+        ? ['Call cost', fmtExactUSD(p.costTotal) + (p.costTotal > costCeiling ? ' (clipped)' : '')]
+        : ['Context window', fmtInt(p.ctx) + ' tok'],
+      ...(usageMode
+        ? [['Usage', `${fmtInt(p.usageTotal)} tok · ${pctOf(p.usageTotal)}`],
+           ['Used so far', pctOf(p.cumUsage)]]
+        : [['Spent so far', fmtExactUSD(p.cum)]]),
+      ['Model', p.e.modelLabel || '—'],
+    ];
+  };
 
   if (useBars) {
     // A hit target per band, so hovering a column never demands pixel
@@ -1314,9 +1576,18 @@ function renderSessionDetail(session, events) {
   const gridNote = el('detail-grid-note');
   gridNote.hidden = !gridFits;
   if (gridFits) {
-    gridNote.textContent = useBars
-      ? 'Each square is one unit of spend — measured per column band, not the drawn bar width.'
-      : 'Each square is one unit of spend — count the squares under the curve.';
+    if (usageMode) {
+      gridNote.textContent =
+        `Each square is 1% of a 5-hour window (~${compact(moneyGrid.value)} tokens) — ` +
+        (useBars
+          ? 'measured per column band, not the drawn bar width. '
+          : 'count the squares under the curve. ') +
+        'Compaction bars are widened and flattened in proportion, so their area still counts.';
+    } else {
+      gridNote.textContent = useBars
+        ? 'Each square is one unit of spend — measured per column band, not the drawn bar width.'
+        : 'Each square is one unit of spend — count the squares under the curve.';
+    }
   }
 
   el('detail-legend').innerHTML =
@@ -1324,7 +1595,10 @@ function renderSessionDetail(session, events) {
       (s) => `<span class="item"><span class="swatch" style="background:${s.color}"></span>${s.label}</span>`,
     ).join('') +
     `<span class="item"><span class="swatch" style="background:var(--cumulative)"></span>` +
-    `Spent so far — right axis (${fmtExactUSD(cumHi)})</span>` +
+    (usageMode
+      ? `Used so far — right axis (${(cumHi / QUOTA_TOKENS_PER_PERCENT).toFixed(1)}% of a 5-hour window)`
+      : `Spent so far — right axis (${fmtExactUSD(cumHi)})`) +
+    '</span>' +
     (inRange.length
       ? `<span class="item"><span class="swatch" style="background:var(--critical)"></span>Compaction (${inRange.length})</span>`
       : '') +
@@ -1356,21 +1630,211 @@ function renderSessionDetail(session, events) {
     ? `Table view — model calls (last ${shown} of ${fmtInt(points.length)} in view)`
     : `Table view — model calls (last ${shown})`;
   el('detail-table').innerHTML =
-    '<thead><tr><th class="num">#</th><th>Model</th>' +
+    '<thead><tr><th class="num">#</th><th>Time</th><th>Model</th>' +
     STACK.map((s) => `<th class="num">${s.label}</th>`).join('') +
     (costMode
       ? '<th class="num">Call cost</th>'
-      : '<th class="num">Context</th><th class="num">Cost</th>') +
+      : usageMode
+        ? '<th class="num">Usage</th><th class="num">% window</th>'
+        : '<th class="num">Context</th><th class="num">Cost</th>') +
     '</tr></thead><tbody>' +
     points.slice(-40).map((p) =>
-      `<tr><td class="num">${p.i + 1}</td><td>${p.e.modelLabel || '—'}</td>` +
+      `<tr><td class="num">${p.i + 1}</td><td>${fmtClock(p.e.timestamp)}</td>` +
+      // A compaction has no model of its own; naming the event is more useful
+      // than an em dash, and it is the only row type where the token columns
+      // are legitimately blank.
+      `<td>${p.compaction ? 'Compaction' : (p.e.modelLabel || '—')}</td>` +
       STACK.map((s, si) =>
-        `<td class="num">${costMode ? fmtExactUSD(p.costs[si]) : fmtInt(p.parts[si])}</td>`,
+        `<td class="num">${
+          p.compaction ? '—' : costMode ? fmtExactUSD(p.costs[si]) : fmtInt(p.parts[si])
+        }</td>`,
       ).join('') +
       (costMode
         ? `<td class="num">${fmtExactUSD(p.costTotal)}</td>`
-        : `<td class="num">${fmtInt(p.ctx)}</td><td class="num">${fmtExactUSD(p.e.cost.total)}</td>`) +
+        : usageMode
+          ? `<td class="num">${fmtInt(p.usageTotal)}</td>` +
+            `<td class="num">${(p.usageTotal / QUOTA_TOKENS_PER_PERCENT).toFixed(2)}%</td>`
+          : `<td class="num">${fmtInt(p.ctx)}</td>` +
+            `<td class="num">${fmtExactUSD((p.e.cost && p.e.cost.total) || 0)}</td>`) +
       '</tr>',
+    ).join('') +
+    '</tbody>';
+}
+
+// --- Quota weight: the session measured against a 5-hour window -------------
+//
+// Cost and quota are different meters. A cache-read token is ~10x cheaper than
+// fresh input but still has to be pushed through the model, so a session can
+// run up a large share of the rolling 5-hour limit while costing very little.
+// The dollar charts above cannot show that; this panel is the same session
+// counted in the unit the limit is actually spent in.
+//
+// CALIBRATION — an estimate, but one checked against a matched reading.
+// `/usage` reported 95% consumed at a moment when this project's transcripts
+// summed to 1,165,150 tokens for the calls inside that window, implying a
+// window near 1.23m tokens. The two accountings agree closely enough that
+// summed transcript tokens look like the right quantity to measure.
+//
+// Still assumes every token type counts equally toward the limit, which is
+// unverified — Anthropic does not document the metering, and the dashboard has
+// no access to account-level usage state. It also cannot see sessions outside
+// the watched projects directory, so the figure is a floor, not a total.
+//
+// To recalibrate: compare the percentage below against `/usage` in the same
+// window and set WINDOW_TOKENS = tokens / (percent / 100).
+const WINDOW_TOKENS = 1_230_000;
+
+// The panel measures a trailing 5-hour span rather than the whole session.
+// Sessions routinely straddle a window reset — summing one end to end reports
+// things like 240% of a window, which is not a quantity that exists. Where the
+// real boundaries fall is not in the transcript data, so this counts the last
+// five hours of activity: correct whenever a window's worth of work is recent,
+// and never inventing a boundary it cannot know.
+const WINDOW_MS = 5 * 60 * 60 * 1000;
+const QUOTA_SQUARE_TOKENS = WINDOW_TOKENS / 100; // one square = 1% of a window
+
+// Every token that crosses the model counts the same here. Deliberately not
+// weighted by price — that is what the cost charts are for.
+const quotaTokensOf = (u) =>
+  (u.inputTokens || 0) + (u.cacheReadTokens || 0) +
+  (u.cacheCreationTokens || 0) + (u.outputTokens || 0);
+
+function renderQuota(session, events) {
+  const host = el('quota-chart');
+  host.innerHTML = '';
+  const all = events
+    .filter((e) => e.kind === 'chat_completion' && e.timestamp)
+    .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  // Anchored to the last call rather than to `now`, so an old session still
+  // shows the window it actually ran in instead of an empty grid.
+  const anchor = all.length ? Date.parse(all[all.length - 1].timestamp) : 0;
+  const calls = all.filter((e) => anchor - Date.parse(e.timestamp) < WINDOW_MS);
+  const excluded = all.length - calls.length;
+
+  if (!calls.length) {
+    el('quota-sub').textContent = '';
+    el('quota-total').textContent = '';
+    el('quota-note').textContent = '';
+    el('quota-legend').innerHTML = '';
+    el('quota-table').innerHTML = '';
+    host.innerHTML = '<p class="empty">No model calls in this session.</p>';
+    return;
+  }
+
+  // Cumulative, in the same call order as the session chart above.
+  let running = 0;
+  const points = calls.map((e, i) => {
+    const tokens = quotaTokensOf(e.usage);
+    running += tokens;
+    return { i, e, tokens, cum: running, pct: running / QUOTA_SQUARE_TOKENS };
+  });
+
+  const totalTokens = running;
+  const totalPct = totalTokens / QUOTA_SQUARE_TOKENS;
+
+  const span =
+    (Date.parse(calls[calls.length - 1].timestamp) - Date.parse(calls[0].timestamp)) / 60000;
+  el('quota-sub').textContent =
+    `${fmtInt(calls.length)} calls over ${span < 60 ? Math.round(span) + 'm' : (span / 60).toFixed(1) + 'h'} · ` +
+    `${compact(totalTokens)} tokens through the model — one square is 1% of a 5-hour window.`;
+  el('quota-total').innerHTML =
+    `${totalPct.toFixed(1)}%<span class="headline-label">of a 5-hour window</span>`;
+  el('quota-note').textContent =
+    `Estimated: 1 square ≈ ${compact(QUOTA_SQUARE_TOKENS)} tokens, from a ` +
+    `${compact(WINDOW_TOKENS)}-token window calibrated against /usage. ` +
+    'Counts this session only, over the trailing 5 hours' +
+    (excluded ? ` (${fmtInt(excluded)} earlier calls excluded).` : '.');
+
+  // Squares accrue left to right, wrapping into rows of 20 — a fifth of a
+  // window per row, so a full window is five rows and the eye can count it
+  // without a scale. Past 100 the grid keeps going rather than capping: the
+  // panel does not know where the real window boundaries fall, so pretending
+  // it fills up and stops would be a claim it cannot support.
+  const PER_ROW = 20;
+  const filled = Math.floor(totalPct);
+  const partial = totalPct - filled;
+  const rows = Math.max(5, Math.ceil(totalPct / PER_ROW) || 1);
+  const W = Math.max(host.clientWidth || 720, 320);
+  const pad = 2;
+  const side = Math.min(28, Math.floor((W - pad * (PER_ROW - 1)) / PER_ROW));
+  const gridW = side * PER_ROW + pad * (PER_ROW - 1);
+  const H = rows * (side + pad) + 8;
+
+  const svg = svgEl('svg', { viewBox: `0 0 ${gridW} ${H}`, height: H });
+
+  const cell = (n) => ({ cx: (n % PER_ROW) * (side + pad), cy: Math.floor(n / PER_ROW) * (side + pad) });
+
+  // Empty slots for the first five rows, so an under-full window still reads
+  // as a proportion of something rather than a bare row of squares.
+  for (let n = 0; n < Math.max(100, rows * PER_ROW); n++) {
+    const { cx, cy } = cell(n);
+    svg.appendChild(svgEl('rect', {
+      x: cx, y: cy, width: side, height: side, rx: 2,
+      fill: 'none', stroke: 'var(--grid)', 'stroke-width': 1,
+    }));
+  }
+
+  for (let n = 0; n < filled; n++) {
+    const { cx, cy } = cell(n);
+    svg.appendChild(svgEl('rect', {
+      x: cx, y: cy, width: side, height: side, rx: 2, fill: 'var(--quota)',
+    }));
+  }
+
+  // The remainder is drawn as a part-height square rather than rounded away:
+  // at 12k tokens a square, a rounded-off tail is real usage.
+  if (partial > 0.02) {
+    const { cx, cy } = cell(filled);
+    const h = Math.max(1, side * partial);
+    svg.appendChild(svgEl('rect', {
+      x: cx, y: cy + (side - h), width: side, height: h, rx: 2,
+      fill: 'var(--quota)', 'fill-opacity': 0.55,
+    }));
+  }
+
+  // The 100% boundary, drawn only once there is something on the far side of
+  // it — otherwise the fifth row's outline already marks it.
+  if (totalPct > 100) {
+    const y100 = 5 * (side + pad) - pad / 2;
+    svg.appendChild(svgEl('line', {
+      x1: 0, x2: gridW, y1: y100, y2: y100,
+      stroke: 'var(--critical)', 'stroke-width': 1.5, 'stroke-dasharray': '4 3',
+    }));
+  }
+
+  const hit = svgEl('rect', {
+    x: 0, y: 0, width: gridW, height: H, fill: 'transparent',
+  });
+  hit.addEventListener('mousemove', (e) =>
+    showTip(e, 'Quota weight', [
+      ['Share of window', totalPct.toFixed(1) + '%'],
+      ['Tokens', fmtInt(totalTokens)],
+      ['Squares', fmtInt(filled) + ' full'],
+      ['Per square', compact(QUOTA_SQUARE_TOKENS) + ' tok'],
+      ['Session cost', fmtUSD(session.totals.cost)],
+    ]));
+  hit.addEventListener('mouseleave', hideTip);
+  svg.appendChild(hit);
+
+  host.appendChild(svg);
+
+  el('quota-legend').innerHTML =
+    `<span class="item"><span class="swatch" style="background:var(--quota)"></span>` +
+    '1% of a 5-hour window</span>';
+
+  // Last 40 calls, matching the session table above, with the running share so
+  // the squares are readable as numbers too.
+  const shown = points.slice(-40);
+  el('quota-table').innerHTML =
+    '<thead><tr><th class="num">#</th><th>Time</th><th>Model</th>' +
+    '<th class="num">Tokens</th><th class="num">Cumulative</th><th class="num">Window %</th>' +
+    '</tr></thead><tbody>' +
+    shown.map((p) =>
+      `<tr><td class="num">${p.i + 1}</td><td>${fmtClock(p.e.timestamp)}</td>` +
+      `<td>${p.e.modelLabel || '—'}</td>` +
+      `<td class="num">${fmtInt(p.tokens)}</td>` +
+      `<td class="num">${fmtInt(p.cum)}</td>` +
+      `<td class="num">${p.pct.toFixed(2)}%</td></tr>`,
     ).join('') +
     '</tbody>';
 }
@@ -1453,6 +1917,9 @@ const panelOpen = (id) => {
 
 function renderAll() {
   if (panelOpen('daily')) renderDaily(stats.daily);
+  // Quota rides along here so resize and theme changes re-lay it out; it draws
+  // from the cached session payload, not from `stats`.
+  if (detailData && panelOpen('quota-chart')) renderQuota(detailData.session, detailData.events);
 
   if (panelOpen('models')) renderBars('models', 'models-table', stats.models, {
     value: (m) => m.cost,
@@ -1538,6 +2005,10 @@ for (const panel of document.querySelectorAll('.panel')) {
     if (!panel.open) return;
     if (panel.id === 'detail-card') {
       if (detailData) renderSessionDetail(detailData.session, detailData.events);
+    } else if (panel.id === 'quota-card') {
+      // Same session payload as the breakdown, so it re-renders from the cache
+      // rather than needing a fetch.
+      if (detailData) renderQuota(detailData.session, detailData.events);
     } else if (stats) {
       renderAll();
     }
