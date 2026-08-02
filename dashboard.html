@@ -449,8 +449,29 @@ const STACK = [
 // model disagreed with itself by 90% between the same two windows. A quantity
 // that is stable across windows is a unit; one that doubles is not.
 //
-// The pooled figure is ~2,428 output tokens per point, i.e. a 5-hour window is
-// roughly 243k output tokens.
+// The figure is ~2,700 output tokens per point, i.e. a 5-hour window is roughly
+// 270k output tokens. It was 2,428 when first fitted at 41% into the clean
+// window; by 56% the same window gave 2,736. Treat +/-15% as the real accuracy
+// and do not chase the last percent — the meter reports whole numbers, so a
+// single point is already +/-0.5 quantization.
+//
+// Cache read was re-tested once the clean window had grown to 56% and 53 meter
+// crossings, since a longer session is the natural probe for a weak input term.
+// It is still not there:
+//
+//  - Forcing any non-zero cache-read weight monotonically *worsens* the fit
+//    (MAPE 9.2% at w=0, 10.6% at 1/1000, 20.1% at 1/10). A real contribution
+//    would improve it at some weight.
+//  - Differencing the series breaks the collinearity that defeated earlier
+//    attempts (corr(cumOut, cumCacheRead) 0.990 -> corr(dOut, dCacheRead)
+//    0.515). The two-term fit then returns a *positive* cache-read coefficient
+//    (~1/1749 of an output token), but its bootstrap 95% CI straddles zero
+//    [-4.7e-8, +4.0e-7] and, decisively, it makes holdout prediction worse
+//    (23.96% vs 23.40%). It was fitting noise.
+//
+// So: output-only stands. This does not prove the weight is exactly zero — it
+// bounds it below roughly 1/1000 of an output token, which is invisible in
+// ordinary traffic and would take designed probes to pin down.
 //
 // Why the old total-token model looked right for so long: cache read is
 // 94-99.5% of every turn and scales with output over a long session, so
@@ -477,9 +498,9 @@ const STACK = [
 //    input is 94-99.5% cache read at Opus rates.
 //
 // To settle it: run a window with substantial Sonnet traffic and fit the same
-// way (low range, extrapolate high). Landing near 2,428 means raw tokens;
+// way (low range, extrapolate high). Landing near 2,700 means raw tokens;
 // landing ~5x higher means cost.
-const QUOTA_OUTPUT_TOKENS_PER_PERCENT = 2_428;
+const QUOTA_OUTPUT_TOKENS_PER_PERCENT = 2_700;
 
 // The model the constant was calibrated against. Shown wherever the unit is,
 // so a Sonnet session does not silently inherit an Opus-derived figure.

@@ -93,7 +93,11 @@ different from the other two, and all are load-bearing:
 - **It plots output tokens only.** The 5-hour meter tracks generation, not
   throughput. Cache reads dominate every other view in this dashboard and are
   excluded entirely here. This is the opposite of the token and cost views, so
-  it looks wrong at a glance and is not — see the constant's comment.
+  it looks wrong at a glance and is not — see the constant's comment. Cache read
+  was re-tested on a 56%, 53-crossing single-session window and is still absent:
+  any forced weight worsens the fit, and the one positive coefficient that
+  differencing produced failed its holdout. It is bounded below ~1/1000 of an
+  output token, not proven zero.
 - **Compactions are drawn as bars,** sized by `compactMetadata.postTokens` (the
   summary written), *not* `preTokens` (the context read, which is input and
   therefore unmetered). A compaction has no `usage` record, so it is invisible
@@ -119,7 +123,7 @@ than silently borrowing the figure. Whether the constant is per-model is an open
 question the data cannot settle: if the meter counts raw output tokens it is
 universal, and if it counts cost in output-equivalents a cheaper model should
 consume more slowly. Resolve it by fitting a window of substantial Sonnet
-traffic the same way — landing near 2,428 means raw tokens, ~5× higher means
+traffic the same way — landing near 2,700 means raw tokens, ~5× higher means
 cost.
 
 Note this differs from the Copilot-era chart it's modeled on, which summed
@@ -147,7 +151,7 @@ Do not add an inferred "percent of your plan used" figure **from token counts
 alone**. It would look authoritative and be a guess.
 
 The one sanctioned exception is the **Usage per turn** mode, whose unit
-(`QUOTA_OUTPUT_TOKENS_PER_PERCENT` ≈ 2,428 output tokens per point) is measured
+(`QUOTA_OUTPUT_TOKENS_PER_PERCENT` ≈ 2,700 output tokens per point) is measured
 rather than assumed — see the comment on that constant for the holdout tests. It
 is still an estimate of a *session's* contribution, not an account-wide reading:
 the meter is account-wide and counts sessions outside the watched directory, so
