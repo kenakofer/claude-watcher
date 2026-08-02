@@ -90,32 +90,21 @@ There is a third mode, **Usage per turn**, whose job is quota. It is read as
 *area*, with a grid square equal to 1% of a 5-hour window. Three things make it
 different from the other two, and all are load-bearing:
 
-- **It plots output tokens only.** The 5-hour meter tracks generation, not
-  throughput. Cache reads dominate every other view in this dashboard and are
-  excluded entirely here. This is the opposite of the token and cost views, so
-  it looks wrong at a glance and is not — see the constant's comment. Cache read
-  was re-tested on a 56%, 53-crossing single-session window and is still absent:
-  any forced weight worsens the fit, and the one positive coefficient that
-  differencing produced failed its holdout. It is bounded below ~1/1000 of an
-  output token, not proven zero.
-- **Compactions are drawn as bars,** sized by `compactMetadata.postTokens` (the
-  summary written), *not* `preTokens` (the context read, which is input and
-  therefore unmetered). A compaction has no `usage` record, so it is invisible
-  to every per-call total elsewhere in the file; omitting it under-counts badly.
-  In practice compactions are ~15% of a long session's quota across a handful of
-  events, because a summary is pure generation.
-- **It never clips silently.** Cost mode clips at ~p98 and that is fine there,
-  because a clipped bar still reads as "off the top" on a rate axis. Here area
-  *is* the quantity, so clipping would destroy it. An oversized compaction is
-  instead drawn wider and proportionally shorter (`spreadFor`), preserving area.
-  If you need to tame a tall bar, widen it — never cut it.
-
-  The widening is capped at 4 bands, and on real data that cap binds: a median
-  compaction wants ×5–×9. A capped bar therefore *does* under-draw its area, so
-  it is hatched, counted in the grid note, and reports its true percentage in
-  the tooltip. That disclosure is the load-bearing part — if you change the cap
-  or the geometry, keep it. An under-drawn bar that looks ordinary is the exact
-  failure this mode exists to avoid.
+- **It plots output plus cache write, never cache read.** One point is ~3,500
+  output tokens *or* ~29,000 cache-write tokens (about 1/8 of an output token
+  each). Cache read is the dominant quantity in every other view here and is not
+  metered at all — in a three-term fit it lands at 1 point per ~34M tokens and
+  improves MAPE by 0.03pp.
+- **Compactions contribute zero,** and are drawn as dashed markers rather than
+  bars. The summary is written into a fresh cache, which appears as a large
+  `cacheCreationTokens` on the *next ordinary call* — verified across 60
+  compactions, where the following call's cache write covers `postTokens` 85% of
+  the time. Charging the boundary as well double-counts: calls alone predict
+  68.6% against an actual 68%, and adding `postTokens` gives 69.0%. If you make
+  compactions carry quota again, check that number first.
+- **It never clips.** Cost mode clips at ~p98 and that is fine there, because a
+  clipped bar still reads as "off the top" on a rate axis. Here area *is* the
+  quantity, so clipping would destroy it.
 
 The unit is **measured on Opus 5 only** (`QUOTA_CALIBRATION_MODEL`). Sessions
 that ran mostly on another model get an explicit warning in the grid note rather
@@ -123,7 +112,7 @@ than silently borrowing the figure. Whether the constant is per-model is an open
 question the data cannot settle: if the meter counts raw output tokens it is
 universal, and if it counts cost in output-equivalents a cheaper model should
 consume more slowly. Resolve it by fitting a window of substantial Sonnet
-traffic the same way — landing near 2,700 means raw tokens, ~5× higher means
+traffic the same way — landing near 3,500 means raw tokens, ~5× higher means
 cost.
 
 Note this differs from the Copilot-era chart it's modeled on, which summed
@@ -151,17 +140,27 @@ Do not add an inferred "percent of your plan used" figure **from token counts
 alone**. It would look authoritative and be a guess.
 
 The one sanctioned exception is the **Usage per turn** mode, whose unit
-(`QUOTA_OUTPUT_TOKENS_PER_PERCENT` ≈ 2,700 output tokens per point) is measured
+(`QUOTA_OUTPUT_TOKENS_PER_PERCENT` ≈ 3,500 output tokens per point, plus a
+cache-write term) is measured
 rather than assumed — see the comment on that constant for the holdout tests. It
 is still an estimate of a *session's* contribution, not an account-wide reading:
 the meter is account-wide and counts sessions outside the watched directory, so
 the figure is a floor.
 
-**The meter tracks output tokens.** This was established by fitting on the 1–19%
-range of a clean window (one session, true 0% start, complete transcripts) and
-extrapolating to 40%: output tokens gave 3.4% error, total tokens 13.4%, API
-duration 43.6%. Predicting that window's final reading from transcripts alone,
-output tokens erred by 6.5% where the previous total-token unit erred by 63%.
+**The meter tracks output tokens and cache writes**, at roughly 1 point per
+3,500 output or 29,000 cache-write tokens. Established on a clean window (one
+session, true 0% start, complete transcripts) by holdout: fitting on 1–36% and
+predicting 37–66% gives 0.99% MAPE for the two-term model against 2.58% for
+output-only, and the cache-write coefficient's bootstrap 95% CI is
+[3.11e-5, 3.87e-5] with P(<0)=0.0000. End to end it predicts the window's
+reading to 0.9%.
+
+The cache-write term was missed at first because ordinary turns write ~1k cache
+tokens against ~500 output, making it a rounding error. A **cache miss** exposed
+it: 172k cache-write tokens in one call moved the meter 58%→66% where
+output-only predicted ~1 point. If you are trying to identify a weak term, look
+for the event that breaks the usual ratio between regressors — ordinary traffic
+never will.
 
 Two total-token models were tried and **rejected**. Both failed the same way, so
 the failure mode is worth naming: cache read is 94–99.5% of every turn and

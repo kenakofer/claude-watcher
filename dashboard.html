@@ -449,29 +449,33 @@ const STACK = [
 // model disagreed with itself by 90% between the same two windows. A quantity
 // that is stable across windows is a unit; one that doubles is not.
 //
-// The figure is ~2,700 output tokens per point, i.e. a 5-hour window is roughly
-// 270k output tokens. It was 2,428 when first fitted at 41% into the clean
-// window; by 56% the same window gave 2,736. Treat +/-15% as the real accuracy
-// and do not chase the last percent — the meter reports whole numbers, so a
-// single point is already +/-0.5 quantization.
+// CACHE WRITES COUNT TOO, at about 1/8 of an output token:
 //
-// Cache read was re-tested once the clean window had grown to 56% and 53 meter
-// crossings, since a longer session is the natural probe for a weak input term.
-// It is still not there:
+//   1 point ~= 3,500 output tokens, OR ~29,000 cache-write tokens
 //
-//  - Forcing any non-zero cache-read weight monotonically *worsens* the fit
-//    (MAPE 9.2% at w=0, 10.6% at 1/1000, 20.1% at 1/10). A real contribution
-//    would improve it at some weight.
-//  - Differencing the series breaks the collinearity that defeated earlier
-//    attempts (corr(cumOut, cumCacheRead) 0.990 -> corr(dOut, dCacheRead)
-//    0.515). The two-term fit then returns a *positive* cache-read coefficient
-//    (~1/1749 of an output token), but its bootstrap 95% CI straddles zero
-//    [-4.7e-8, +4.0e-7] and, decisively, it makes holdout prediction worse
-//    (23.96% vs 23.40%). It was fitting noise.
+// This was missed until a cache miss made it visible. Ordinary turns write only
+// ~1k cache tokens against ~500 output, so the cache-write term is a rounding
+// error and an output-only model fits fine. A cache *miss* re-sends the whole
+// context as one large cache write: 172k tokens in a single call, which moved
+// the meter 58% -> 66% while output-only predicted ~1 point. Wrong by ~8x, and
+// only detectable because the event puts the two regressors far out of their
+// usual ratio.
 //
-// So: output-only stands. This does not prove the weight is exactly zero — it
-// bounds it below roughly 1/1000 of an output token, which is invisible in
-// ordinary traffic and would take designed probes to pin down.
+// The two-term model passes everything the one-term model failed:
+//   - holdout (fit 1-36%, predict 37-66%): MAPE 0.99% vs 2.58% for output-only
+//   - bootstrap 95% CI on the cache-write coefficient [3.11e-5, 3.87e-5],
+//     P(<0) = 0.0000
+//
+// Cache READ is still out. In a three-term fit it lands at 1 point per ~34M
+// tokens and improves MAPE by 0.03pp — indistinguishable from zero. Earlier
+// attempts to find it produced a coefficient whose bootstrap CI straddled zero
+// and which made holdout prediction *worse*; that was noise. It is bounded
+// below roughly 1/1000 of an output token, not proven to be exactly zero.
+//
+// Accuracy is ~+/-5% now, but do not over-tune: the meter reports whole
+// percent, so one point already carries +/-0.5 of quantization. Constants have
+// moved twice as the window grew (2,428 at 41% -> 2,700 at 56% -> 3,501 with
+// the cache-write term), so re-check rather than trusting them indefinitely.
 //
 // Why the old total-token model looked right for so long: cache read is
 // 94-99.5% of every turn and scales with output over a long session, so
@@ -498,9 +502,25 @@ const STACK = [
 //    input is 94-99.5% cache read at Opus rates.
 //
 // To settle it: run a window with substantial Sonnet traffic and fit the same
-// way (low range, extrapolate high). Landing near 2,700 means raw tokens;
+// way (low range, extrapolate high). Landing near 3,500 means raw tokens;
 // landing ~5x higher means cost.
-const QUOTA_OUTPUT_TOKENS_PER_PERCENT = 2_700;
+const QUOTA_OUTPUT_TOKENS_PER_PERCENT = 3_501;
+const QUOTA_CACHE_WRITE_TOKENS_PER_PERCENT = 28_957;
+
+// Quota cost of one call, in percent of a 5-hour window. Output dominates on
+// ordinary turns; the cache-write term only matters on cache misses and
+// compaction, which is exactly where it matters most.
+const quotaPctOf = (outputTokens, cacheWriteTokens) =>
+  (outputTokens || 0) / QUOTA_OUTPUT_TOKENS_PER_PERCENT
+  + (cacheWriteTokens || 0) / QUOTA_CACHE_WRITE_TOKENS_PER_PERCENT;
+
+// Expressed in output-token equivalents, so the chart can keep a single linear
+// axis and one grid unit. 1% of a window = QUOTA_OUTPUT_TOKENS_PER_PERCENT of
+// these, whatever mix of output and cache write produced them.
+const quotaEquivOf = (outputTokens, cacheWriteTokens) =>
+  (outputTokens || 0)
+  + (cacheWriteTokens || 0)
+    * (QUOTA_OUTPUT_TOKENS_PER_PERCENT / QUOTA_CACHE_WRITE_TOKENS_PER_PERCENT);
 
 // The model the constant was calibrated against. Shown wherever the unit is,
 // so a Sonnet session does not silently inherit an Opus-derived figure.
@@ -896,14 +916,26 @@ function renderSessionDetail(session, events) {
       ? STACK.map(() => 0)
       : STACK.map((s) => (e.cost && e.cost[s.cost]) || 0);
     const costTotal = costs.reduce((a, b) => a + b, 0);
-    // Output tokens only — see QUOTA_OUTPUT_TOKENS_PER_PERCENT. A compaction
-    // emits a summary, and that summary is its entire metered footprint: the
-    // context it *reads* is input, which the 5-hour meter does not count. So
-    // `postTokens` (the summary written) is the bar, and `preTokens` (the
-    // context consumed) deliberately is not.
+    // Output plus cache write, in output-token equivalents — see
+    // QUOTA_OUTPUT_TOKENS_PER_PERCENT. Cache reads are not metered.
+    //
+    // A compaction contributes ZERO here, which looks wrong and is not. Writing
+    // the summary into a fresh cache shows up as a large `cacheCreationTokens`
+    // on the *next ordinary call* — verified on 60 compactions, where the next
+    // call's cache write covers `postTokens` 85% of the time. Charging the
+    // boundary event as well would count the same tokens twice: over this
+    // window, calls alone predict 68.6% against an actual 68%, and adding
+    // `postTokens` pushes it to 69.0%.
+    //
+    // The bar is still drawn — a compaction is a real event worth seeing — but
+    // it is a marker, not a quantity, and it must stay out of the running
+    // total. Its true cost is visible in the spike on the call after it.
     const usageTotal = compaction
-      ? e.postTokens || 0
-      : (e.usage && e.usage.outputTokens) || 0;
+      ? 0
+      : quotaEquivOf(
+          (e.usage && e.usage.outputTokens) || 0,
+          (e.usage && e.usage.cacheCreationTokens) || 0,
+        );
     // Accumulated from the first call of the session, not the first visible
     // one: "spent so far" is a property of the session, so zooming into a
     // later window must not restart the total at zero.
@@ -990,49 +1022,11 @@ function renderSessionDetail(session, events) {
   // rate and a clipped bar still reads as "off the top" — but usage mode's
   // contract is that *area is quota*, and a clipped bar silently destroys area.
   //
-  // A compaction writes a whole summary in one event, so its bar can exceed the
-  // tallest ordinary turn and would flatten everything else. Instead of cutting
-  // the height, spread it sideways: draw the bar `spread` bands wide at
-  // 1/`spread` of the height. Area — and therefore the square count — is
-  // exactly preserved, while the peak comes down to something the shared axis
-  // can hold. In practice a summary is a few thousand output tokens, comparable
-  // to a long turn, so `spread` is usually 1; it exists for the outliers.
-  const usageValues = points
-    .filter((p) => !p.compaction)
-    .map((p) => p.usageTotal)
-    .sort((a, b) => a - b);
-  // Reference height is the ordinary traffic, not the compactions: that is what
-  // the axis needs to show legibly.
-  const usageTypical = usageValues.length
-    ? usageValues[Math.floor(usageValues.length * 0.98)]
-    : 1;
-  // Widen only as far as needed to bring a compaction near the ordinary peak,
-  // capped so a bar never becomes an unreadable smear across the plot.
-  //
-  // A median compaction generates ~9.7k output tokens against a p98 turn's
-  // ~1.5k, so this routinely wants x6 or more and the cap binds. That is a real
-  // tension: spreading is area-preserving only while the requested width is
-  // granted, so a capped bar under-draws its area — the one thing this mode
-  // promises not to do. The cap wins anyway (a 7-band bar buries its
-  // neighbours), and the shortfall is disclosed instead of hidden: capped bars
-  // are hatched, counted in the legend, and report their true percentage in the
-  // tooltip. Silent under-drawing is what we are avoiding, not under-drawing.
-  const SPREAD_CAP = 4;
-  const spreadWanted = (p) => {
-    if (!p.compaction || !usageTypical) return 1;
-    return Math.max(1, Math.round(p.usageTotal / usageTypical));
-  };
-  const spreadFor = (p) => Math.min(SPREAD_CAP, spreadWanted(p));
-  const spreadCapped = (p) => spreadWanted(p) > SPREAD_CAP;
-  // The ceiling is set by what is actually drawn. Capped bars are allowed to
-  // exceed it and are clamped by y() — they are already flagged as capped, so a
-  // taller-than-axis bar reads as "this one is off the scale" rather than as a
-  // quiet inaccuracy.
-  const usageMax = Math.max(
-    ...points.map((p) => p.usageTotal / spreadFor(p)),
-    1,
-  );
-  const usageCeiling = usageMax;
+  // The spread/cap machinery that used to live here is gone. It existed because
+  // compactions were charged their summary as output, making their bars 5-9x an
+  // ordinary turn. They are not charged at all now — the re-cache lands on the
+  // following call — so there is no oversized bar left to tame.
+  const usageCeiling = Math.max(...points.map((p) => p.usageTotal), 1);
 
   const max = costMode
     ? costCeiling
@@ -1346,52 +1340,23 @@ function renderSessionDetail(session, events) {
     for (let i = 0; i < points.length; i += 1) lower[i] = upper[i];
   });
 
-  // --- Compaction bars (usage mode) -----------------------------------------
+  // --- Compaction markers (usage mode) ---------------------------------------
   //
-  // Drawn after the stack so they sit above it, and in their own colour: a
-  // compaction is not a token type, it is a separate billed event that the
-  // per-call stack cannot represent.
-  //
-  // Width, not height, absorbs the size. `spread` widens the bar and divides
-  // its height by the same factor, so the rectangle's AREA is unchanged and the
-  // money-grid squares under it still count the true quantity. That is the
-  // property worth protecting — clipping the height would have made the bar
-  // legible by lying about how much it cost.
+  // Drawn after the stack so they sit above it. These were bars until the
+  // cache-write term landed: a compaction's real cost is the re-cache on the
+  // *next* call, so charging the boundary too would double-count it.
   if (usageMode) {
-    // Hatch for bars whose spread hit the cap: their drawn area understates the
-    // real quantity, so they must not read as ordinary rectangles.
-    const defs = svgEl('defs', {});
-    const hatch = svgEl('pattern', {
-      id: 'usage-capped',
-      width: 6,
-      height: 6,
-      patternUnits: 'userSpaceOnUse',
-      patternTransform: 'rotate(45)',
-    });
-    hatch.appendChild(svgEl('rect', {
-      width: 6, height: 6, fill: 'var(--critical)', 'fill-opacity': 0.35,
-    }));
-    hatch.appendChild(svgEl('rect', {
-      width: 2, height: 6, fill: 'var(--critical)', 'fill-opacity': 0.9,
-    }));
-    defs.appendChild(hatch);
-    svg.appendChild(defs);
-
+    // Compactions carry no quota of their own, so they are drawn as full-height
+    // markers rather than bars. A bar would imply an area, and the area is zero
+    // — the spike immediately to the right is where the cost actually lands.
     points.forEach((p, i) => {
-      if (!p.compaction || p.usageTotal <= 0) return;
-      const spread = spreadFor(p);
-      const capped = spreadCapped(p);
-      const w = useBars ? Math.max(barW * spread, 3) : Math.max(band * spread, 3);
-      const h = plotH * Math.min(1, p.usageTotal / spread / top);
-      svg.appendChild(svgEl('rect', {
-        x: x(i) - w / 2,
-        y: m.top + plotH - h,
-        width: w,
-        height: h,
-        fill: capped ? 'url(#usage-capped)' : 'var(--critical)',
-        'fill-opacity': capped ? 1 : 0.55,
+      if (!p.compaction) return;
+      svg.appendChild(svgEl('line', {
+        x1: x(i), x2: x(i), y1: m.top, y2: m.top + plotH,
         stroke: 'var(--critical)',
         'stroke-width': 1,
+        'stroke-dasharray': '3 3',
+        'stroke-opacity': 0.7,
       }));
     });
   }
@@ -1542,10 +1507,9 @@ function renderSessionDetail(session, events) {
       return [
         whenRow(p),
         ['Event', 'Compaction' + (p.e.trigger ? ` (${p.e.trigger})` : '')],
-        ['Context summarized', fmtInt(p.e.preTokens || 0) + ' tok (input — not metered)'],
-        ['Summary produced', fmtInt(p.e.postTokens || 0) + ' tok (output)'],
-        ['Quota', pctOf(p.usageTotal)
-          + (spreadCapped(p) ? ' — bar drawn short, see hatching' : '')],
+        ['Context summarized', fmtInt(p.e.preTokens || 0) + ' tok (cache read — not metered)'],
+        ['Summary produced', fmtInt(p.e.postTokens || 0) + ' tok'],
+        ['Quota', 'counted on the next call, as its cache write'],
         ['Used so far', pctOf(p.cumUsage)],
       ];
     }
@@ -1562,7 +1526,9 @@ function renderSessionDetail(session, events) {
         ? ['Call cost', fmtExactUSD(p.costTotal) + (p.costTotal > costCeiling ? ' (clipped)' : '')]
         : ['Context window', fmtInt(p.ctx) + ' tok'],
       ...(usageMode
-        ? [['Quota', `${fmtInt(p.usageTotal)} output tok · ${pctOf(p.usageTotal)}`],
+        ? [['Quota', pctOf(p.usageTotal)
+             + ` (${fmtInt((p.e.usage && p.e.usage.outputTokens) || 0)} out`
+             + ` + ${fmtInt((p.e.usage && p.e.usage.cacheCreationTokens) || 0)} cache write)`],
            ['Used so far', pctOf(p.cumUsage)]]
         : [['Spent so far', fmtExactUSD(p.cum)]]),
       ['Model', p.e.modelLabel || '—'],
@@ -1702,21 +1668,18 @@ function renderSessionDetail(session, events) {
   // `gridFits`, not `moneyGrid`: a value is always chosen, but it is only drawn
   // when it fits the plot. Keying the note off the value alone would describe a
   // square that is nowhere on screen.
-  const cappedCount = usageMode ? points.filter((p) => p.compaction && spreadCapped(p)).length : 0;
   const gridNote = el('detail-grid-note');
   gridNote.hidden = !gridFits;
   if (gridFits) {
     if (usageMode) {
       gridNote.textContent =
-        `Each square is 1% of a 5-hour window (~${compact(moneyGrid.value)} output tokens) — ` +
+        `Each square is 1% of a 5-hour window (~${compact(moneyGrid.value)} output tokens, ` +
+        `or ~${compact(QUOTA_CACHE_WRITE_TOKENS_PER_PERCENT)} cache-write tokens) — ` +
         (useBars
           ? 'measured per column band, not the drawn bar width. '
           : 'count the squares under the curve. ') +
-        'Output only: the 5-hour meter tracks generation, so cache reads are excluded. ' +
-        (cappedCount
-          ? `${cappedCount} compaction${cappedCount === 1 ? '' : 's'} hatched — too tall to `
-            + 'draw to scale, so the bar understates it; the tooltip has the real figure. '
-          : '') +
+        'Output plus cache write; cache reads are not metered. ' +
+        'Dashed lines mark compactions — their cost lands on the following call. ' +
         quotaCalibrationNote(points);
     } else {
       gridNote.textContent = useBars
@@ -1816,7 +1779,6 @@ function renderSessionDetail(session, events) {
 //
 // The dashboard cannot see sessions outside the watched projects directory, and
 // the meter is account-wide, so the figure remains a floor, not a total.
-const WINDOW_OUTPUT_TOKENS = QUOTA_OUTPUT_TOKENS_PER_PERCENT * 100;
 
 // The panel measures a trailing 5-hour span rather than the whole session.
 // Sessions routinely straddle a window reset — summing one end to end reports
@@ -1827,9 +1789,10 @@ const WINDOW_OUTPUT_TOKENS = QUOTA_OUTPUT_TOKENS_PER_PERCENT * 100;
 const WINDOW_MS = 5 * 60 * 60 * 1000;
 const QUOTA_SQUARE_TOKENS = QUOTA_OUTPUT_TOKENS_PER_PERCENT; // one square = 1%
 
-// Output only. Input, cache reads and cache writes are all billed, but none of
-// them move the 5-hour meter — see QUOTA_OUTPUT_TOKENS_PER_PERCENT.
-const quotaTokensOf = (u) => u.outputTokens || 0;
+// Output plus cache write, in output-token equivalents. Cache reads are billed
+// but do not move the meter — see QUOTA_OUTPUT_TOKENS_PER_PERCENT.
+const quotaTokensOf = (u) =>
+  quotaEquivOf(u.outputTokens || 0, u.cacheCreationTokens || 0);
 
 function renderQuota(session, events) {
   const host = el('quota-chart');
@@ -1872,9 +1835,9 @@ function renderQuota(session, events) {
   el('quota-total').innerHTML =
     `${totalPct.toFixed(1)}%<span class="headline-label">of a 5-hour window</span>`;
   el('quota-note').textContent =
-    `Estimated: 1 square ≈ ${compact(QUOTA_SQUARE_TOKENS)} output tokens, from a ` +
-    `${compact(WINDOW_OUTPUT_TOKENS)}-output-token window measured against known ` +
-    'window boundaries. The meter tracks generation, so cache reads are excluded. ' +
+    `Estimated: 1 square ≈ ${compact(QUOTA_SQUARE_TOKENS)} output tokens or ` +
+    `${compact(QUOTA_CACHE_WRITE_TOKENS_PER_PERCENT)} cache-write tokens, measured ` +
+    'against known window boundaries. Cache reads are not metered. ' +
     `Calibrated on ${QUOTA_CALIBRATION_LABEL}. ` +
     'Counts this session only, over the trailing 5 hours' +
     (excluded ? ` (${fmtInt(excluded)} earlier calls excluded).` : '.');
