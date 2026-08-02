@@ -415,6 +415,12 @@ const SERIES = [
 // Stack order for the per-session token chart, bottom band first. Cache read is
 // the largest and sits on the baseline so the smaller bands stay readable above
 // it; the hues match SERIES so a token type means the same color everywhere.
+//
+// `quota` is the band's weight in output-token equivalents, and it is what
+// usage mode stacks. Cache read and input weigh zero — the 5-hour meter does
+// not charge them — so in that mode those bands are simply absent, and the
+// stack height is the same quantity the running total and the 1% grid use. The
+// weights are filled in below, once the quota constants are defined.
 const STACK = [
   { token: 'cacheReadTokens',     cost: 'cacheRead',  label: 'Cache read',  color: 'var(--series-1)' },
   { token: 'cacheCreationTokens', cost: 'cacheWrite', label: 'Cache write', color: 'var(--series-2)' },
@@ -521,6 +527,18 @@ const quotaEquivOf = (outputTokens, cacheWriteTokens) =>
   (outputTokens || 0)
   + (cacheWriteTokens || 0)
     * (QUOTA_OUTPUT_TOKENS_PER_PERCENT / QUOTA_CACHE_WRITE_TOKENS_PER_PERCENT);
+
+// Per-band quota weights, in output-token equivalents per raw token. Derived
+// from the same two constants as quotaEquivOf, so a band's height and the
+// point's `usageTotal` cannot drift apart.
+const QUOTA_WEIGHTS = {
+  cacheReadTokens: 0,
+  inputTokens: 0,
+  outputTokens: 1,
+  cacheCreationTokens:
+    QUOTA_OUTPUT_TOKENS_PER_PERCENT / QUOTA_CACHE_WRITE_TOKENS_PER_PERCENT,
+};
+for (const s of STACK) s.quota = QUOTA_WEIGHTS[s.token] || 0;
 
 // The model the constant was calibrated against. Shown wherever the unit is,
 // so a Sonnet session does not silently inherit an Opus-derived figure.
@@ -842,7 +860,7 @@ function renderSessionDetail(session, events) {
     (detailMode === 'cost'
       ? ''
       : detailMode === 'usage'
-        ? ' — every token metered by the 5-hour limit, compactions included; area is quota.'
+        ? ' — percent of the 5-hour window per turn; only output and cache write are metered.'
         : ' — tokens per turn, stacked; the stack height is the context window.');
   // The total moves out of the descriptive line and into the headline, so it
   // isn't the one number you have to read a sentence to find. It stays labelled
@@ -916,8 +934,13 @@ function renderSessionDetail(session, events) {
       ? STACK.map(() => 0)
       : STACK.map((s) => (e.cost && e.cost[s.cost]) || 0);
     const costTotal = costs.reduce((a, b) => a + b, 0);
-    // Output plus cache write, in output-token equivalents — see
-    // QUOTA_OUTPUT_TOKENS_PER_PERCENT. Cache reads are not metered.
+    // The same bands weighted by what the 5-hour meter actually charges. Cache
+    // read and input weigh zero, so those bands vanish in usage mode instead of
+    // burying the two that count — see QUOTA_WEIGHTS.
+    const quotas = parts.map((v, si) => v * STACK[si].quota);
+    // The call's quota draw, in output-token equivalents — see
+    // QUOTA_OUTPUT_TOKENS_PER_PERCENT. Only output and cache write contribute;
+    // the zero-weight bands drop out of the sum on their own.
     //
     // A compaction contributes ZERO here, which looks wrong and is not. Writing
     // the summary into a fresh cache shows up as a large `cacheCreationTokens`
@@ -927,15 +950,14 @@ function renderSessionDetail(session, events) {
     // window, calls alone predict 68.6% against an actual 68%, and adding
     // `postTokens` pushes it to 69.0%.
     //
-    // The bar is still drawn — a compaction is a real event worth seeing — but
-    // it is a marker, not a quantity, and it must stay out of the running
-    // total. Its true cost is visible in the spike on the call after it.
-    const usageTotal = compaction
-      ? 0
-      : quotaEquivOf(
-          (e.usage && e.usage.outputTokens) || 0,
-          (e.usage && e.usage.cacheCreationTokens) || 0,
-        );
+    // The event is still drawn — a compaction is worth seeing — but as a
+    // full-height dashed marker rather than a bar, because it is an occasion,
+    // not a quantity, and it must stay out of the running total. Its true cost
+    // is visible in the spike on the call after it.
+    //
+    // Summed from `quotas` rather than computed alongside it, so the drawn
+    // stack height and the running total are the same number by construction.
+    const usageTotal = quotas.reduce((a, b) => a + b, 0);
     // Accumulated from the first call of the session, not the first visible
     // one: "spent so far" is a property of the session, so zooming into a
     // later window must not restart the total at zero.
@@ -945,6 +967,7 @@ function renderSessionDetail(session, events) {
       i,
       parts,
       costs,
+      quotas,
       compaction,
       ctx: compaction
         ? 0
@@ -1142,8 +1165,12 @@ function renderSessionDetail(session, events) {
   // single column. Same reasoning as the cumulative axis below.
   const tickStep = ticks.length > 1 ? ticks[1] - ticks[0] : 0;
   const tickDp = tickStep >= 1 ? 2 : tickStep >= 0.1 ? 2 : tickStep >= 0.01 ? 3 : 4;
+  // Usage mode's internal unit is output-token equivalents, but nobody reads
+  // the meter in tokens — it reports whole percent — so the axis is labelled in
+  // percent of a 5-hour window. Two decimals because a single turn is a small
+  // fraction of a window and "0%" repeated down the column says nothing.
   const fmtLeft = usageMode
-    ? (v) => compact(v)
+    ? (v) => (v / QUOTA_OUTPUT_TOKENS_PER_PERCENT).toFixed(2) + '%'
     : (v) => (ticks === baseTicks ? fmtAxisUSD(v) : '$' + v.toFixed(tickDp));
 
   // Bars sit in evenly divided bands; the area path spans edge to edge so the
@@ -1303,10 +1330,23 @@ function renderSessionDetail(session, events) {
 
   // Stacked bands, drawn bottom band first. Each band is the region between
   // the running total below it and the running total including it, so the
-  // height of the whole stack is the context window.
+  // stack height is whatever the mode measures: the context window in token
+  // mode, the call's spend in cost mode, its quota draw in usage mode.
   const lower = new Array(points.length).fill(0);
+  // Each mode stacks its own quantity: dollars, quota-equivalents, or raw
+  // tokens. Usage mode's zero-weight bands contribute nothing and are skipped
+  // by the `upper <= lower` guards below, so no invisible rect is emitted.
+  const bandOf = costMode
+    ? (p, si) => p.costs[si]
+    : usageMode
+      ? (p, si) => p.quotas[si]
+      : (p, si) => p.parts[si];
   STACK.forEach((s, si) => {
-    const upper = points.map((p, i) => lower[i] + (costMode ? p.costs[si] : p.parts[si]));
+    // A band that is zero everywhere draws nothing. The bar path already skips
+    // it per-point; the area path would otherwise emit a zero-height sliver
+    // hugging the band below and darken it through the 0.85 fill.
+    if (usageMode && !s.quota) return;
+    const upper = points.map((p, i) => lower[i] + bandOf(p, si));
 
     if (useBars) {
       // One rect per call. No inter-segment gap here (unlike the daily chart):
@@ -1498,7 +1538,10 @@ function renderSessionDetail(session, events) {
     return ['Time', fmtClock(p.e.timestamp) + (gap ? ` · +${gap}` : '')];
   };
 
-  const pctOf = (v) => (v / QUOTA_OUTPUT_TOKENS_PER_PERCENT).toFixed(2) + '% of a 5-hour window';
+  // Bare percent for the band rows, where the unit is established by the rows
+  // around it; the long form for the summary rows that have to stand alone.
+  const barePct = (v) => (v / QUOTA_OUTPUT_TOKENS_PER_PERCENT).toFixed(2) + '%';
+  const pctOf = (v) => barePct(v) + ' of a 5-hour window';
 
   const tipRows = (p, idx) => {
     // A compaction has no token-type stack to describe, so it gets its own rows
@@ -1515,22 +1558,33 @@ function renderSessionDetail(session, events) {
     }
     return [
       whenRow(p),
-      // Bands top-down, so the tooltip order matches what the eye sees.
-      ...STACK.map((s, si) => [
-        s.label,
-        costMode
-          ? `${fmtExactUSD(p.costs[si])} · ${compact(p.parts[si])} tok`
-          : fmtInt(p.parts[si]) + ' tok',
-      ]).reverse(),
-      costMode
-        ? ['Call cost', fmtExactUSD(p.costTotal) + (p.costTotal > costCeiling ? ' (clipped)' : '')]
-        : ['Context window', fmtInt(p.ctx) + ' tok'],
-      ...(usageMode
-        ? [['Quota', pctOf(p.usageTotal)
-             + ` (${fmtInt((p.e.usage && p.e.usage.outputTokens) || 0)} out`
-             + ` + ${fmtInt((p.e.usage && p.e.usage.cacheCreationTokens) || 0)} cache write)`],
-           ['Used so far', pctOf(p.cumUsage)]]
-        : [['Spent so far', fmtExactUSD(p.cum)]]),
+      // Bands top-down, so the tooltip order matches what the eye sees. Usage
+      // mode lists only the bands it draws, in the axis's own unit: the two
+      // unmetered types are not part of this reading, and printing their token
+      // counts here invites exactly the misreading the mode exists to avoid.
+      ...STACK
+        .filter((s) => !usageMode || s.quota)
+        .map((s) => {
+          const si = STACK.indexOf(s);
+          return [
+            s.label,
+            costMode
+              ? `${fmtExactUSD(p.costs[si])} · ${compact(p.parts[si])} tok`
+              : usageMode
+                ? barePct(p.quotas[si])
+                : fmtInt(p.parts[si]) + ' tok',
+          ];
+        })
+        .reverse(),
+      ...(costMode
+        ? [['Call cost',
+            fmtExactUSD(p.costTotal) + (p.costTotal > costCeiling ? ' (clipped)' : '')],
+           ['Spent so far', fmtExactUSD(p.cum)]]
+        : usageMode
+          ? [['Quota', pctOf(p.usageTotal)],
+             ['Used so far', pctOf(p.cumUsage)]]
+          : [['Context window', fmtInt(p.ctx) + ' tok'],
+             ['Spent so far', fmtExactUSD(p.cum)]]),
       ['Model', p.e.modelLabel || '—'],
     ];
   };
@@ -1688,8 +1742,13 @@ function renderSessionDetail(session, events) {
     }
   }
 
+  // The series this mode actually draws. Usage mode omits the unmetered types
+  // — a swatch or a column for a band that isn't there describes a different
+  // chart. Shared by the legend and the table below.
+  const cols = STACK.filter((s) => !usageMode || s.quota);
+
   el('detail-legend').innerHTML =
-    STACK.slice().reverse().map(
+    cols.slice().reverse().map(
       (s) => `<span class="item"><span class="swatch" style="background:${s.color}"></span>${s.label}</span>`,
     ).join('') +
     `<span class="item"><span class="swatch" style="background:var(--cumulative)"></span>` +
@@ -1729,11 +1788,11 @@ function renderSessionDetail(session, events) {
     : `Table view — model calls (last ${shown})`;
   el('detail-table').innerHTML =
     '<thead><tr><th class="num">#</th><th>Time</th><th>Model</th>' +
-    STACK.map((s) => `<th class="num">${s.label}</th>`).join('') +
+    cols.map((s) => `<th class="num">${s.label}</th>`).join('') +
     (costMode
       ? '<th class="num">Call cost</th>'
       : usageMode
-        ? '<th class="num">Output</th><th class="num">% window</th>'
+        ? '<th class="num">% window</th><th class="num">Used so far</th>'
         : '<th class="num">Context</th><th class="num">Cost</th>') +
     '</tr></thead><tbody>' +
     points.slice(-40).map((p) =>
@@ -1742,16 +1801,20 @@ function renderSessionDetail(session, events) {
       // than an em dash, and it is the only row type where the token columns
       // are legitimately blank.
       `<td>${p.compaction ? 'Compaction' : (p.e.modelLabel || '—')}</td>` +
-      STACK.map((s, si) =>
-        `<td class="num">${
-          p.compaction ? '—' : costMode ? fmtExactUSD(p.costs[si]) : fmtInt(p.parts[si])
-        }</td>`,
-      ).join('') +
+      cols.map((s) => {
+        const si = STACK.indexOf(s);
+        return `<td class="num">${
+          p.compaction ? '—'
+            : costMode ? fmtExactUSD(p.costs[si])
+              : usageMode ? barePct(p.quotas[si])
+                : fmtInt(p.parts[si])
+        }</td>`;
+      }).join('') +
       (costMode
         ? `<td class="num">${fmtExactUSD(p.costTotal)}</td>`
         : usageMode
-          ? `<td class="num">${fmtInt(p.usageTotal)}</td>` +
-            `<td class="num">${(p.usageTotal / QUOTA_OUTPUT_TOKENS_PER_PERCENT).toFixed(2)}%</td>`
+          ? `<td class="num">${barePct(p.usageTotal)}</td>` +
+            `<td class="num">${barePct(p.cumUsage)}</td>`
           : `<td class="num">${fmtInt(p.ctx)}</td>` +
             `<td class="num">${fmtExactUSD((p.e.cost && p.e.cost.total) || 0)}</td>`) +
       '</tr>',
