@@ -86,15 +86,20 @@ Don't "fix" the token view by log-scaling or dropping cache read — the token
 view's job is the sawtooth (how big context gets, and the compaction drop); the
 cost view's job is where the money went. Keep both.
 
-There is a third mode, **Usage per turn**, whose job is quota. It plots the same
-unweighted token quantity as the token view but is read as *area*, with a grid
-square equal to a fixed share of a 5-hour window. Two things make it different
-from the other two, and both are load-bearing:
+There is a third mode, **Usage per turn**, whose job is quota. It is read as
+*area*, with a grid square equal to 1% of a 5-hour window. Three things make it
+different from the other two, and all are load-bearing:
 
-- **Compactions are drawn as bars.** A compaction is billed but has no `usage`
-  record, so it is invisible to every per-call total elsewhere in the file. Its
-  size comes from `compactMetadata.preTokens`/`postTokens` on the boundary
-  event. Omitting it under-counts precisely where per-event cost is highest.
+- **It plots output tokens only.** The 5-hour meter tracks generation, not
+  throughput. Cache reads dominate every other view in this dashboard and are
+  excluded entirely here. This is the opposite of the token and cost views, so
+  it looks wrong at a glance and is not — see the constant's comment.
+- **Compactions are drawn as bars,** sized by `compactMetadata.postTokens` (the
+  summary written), *not* `preTokens` (the context read, which is input and
+  therefore unmetered). A compaction has no `usage` record, so it is invisible
+  to every per-call total elsewhere in the file; omitting it under-counts badly.
+  In practice compactions are ~15% of a long session's quota across a handful of
+  events, because a summary is pure generation.
 - **It never clips.** Cost mode clips at ~p98 and that is fine there, because a
   clipped bar still reads as "off the top" on a rate axis. Here area *is* the
   quantity, so clipping would silently destroy it. An oversized compaction is
@@ -126,19 +131,27 @@ Do not add an inferred "percent of your plan used" figure **from token counts
 alone**. It would look authoritative and be a guess.
 
 The one sanctioned exception is the **Usage per turn** mode, whose unit
-(`QUOTA_TOKENS_PER_PERCENT`) is measured rather than assumed — see the comment
-on that constant. Two independent methods agree to 99.4%: a window with known
-boundaries (from the statusline's `rate_limits.resets_at`, which this dashboard
-cannot see) and an earlier `/usage` calibration. It is still an estimate of a
-*session's* contribution, not an account-wide reading — the meter is
-account-wide and counts sessions outside the watched directory, so the figure is
-a floor.
+(`QUOTA_OUTPUT_TOKENS_PER_PERCENT` ≈ 2,428 output tokens per point) is measured
+rather than assumed — see the comment on that constant for the holdout tests. It
+is still an estimate of a *session's* contribution, not an account-wide reading:
+the meter is account-wide and counts sessions outside the watched directory, so
+the figure is a floor.
 
-A per-token-type weighting was tried and **rejected**: it was fitted on
-per-session meter deltas, but the meter is account-wide, so with two sessions
-live each delta was driven by both while charged to one — inflating the implied
-per-token cost ~14x. The unweighted sum tracks the meter to ~1%. Do not
-reintroduce price weights here without re-measuring over a whole window.
+**The meter tracks output tokens.** This was established by fitting on the 1–19%
+range of a clean window (one session, true 0% start, complete transcripts) and
+extrapolating to 40%: output tokens gave 3.4% error, total tokens 13.4%, API
+duration 43.6%. Predicting that window's final reading from transcripts alone,
+output tokens erred by 6.5% where the previous total-token unit erred by 63%.
+
+Two total-token models were tried and **rejected**. Both failed the same way, so
+the failure mode is worth naming: cache read is 94–99.5% of every turn and
+scales with output *within* a window, so a total-token unit validates locally
+and then disagrees with itself by ~90% across windows with different context
+sizes. An earlier per-token-type price weighting failed differently — it was fit
+on per-session meter deltas while the meter is account-wide, inflating the
+implied cost ~14x. Do not re-derive this unit from total tokens, and do not fit
+it on single-session deltas; calibrate only over whole windows with a known
+`resets_at` and a true 0% start.
 
 ## Key gotcha 4: charts inside a collapsed `<details>` measure 0 width
 

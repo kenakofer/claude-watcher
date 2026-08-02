@@ -424,32 +424,50 @@ const STACK = [
 
 // --- Quota unit -------------------------------------------------------------
 //
-// Tokens per 1% of a rolling 5-hour window, measured rather than assumed.
+// OUTPUT tokens per 1% of a rolling 5-hour window, measured rather than assumed.
 //
-// Derived from a window whose real boundaries were known (the statusline's
+// The 5-hour meter tracks output tokens, not total throughput. That is the
+// single most surprising thing in this file, so the evidence is worth stating.
+//
+// Measured over a window with real boundaries (the statusline's
 // `rate_limits.resets_at`, which this dashboard cannot see — the figure comes
-// from a separate measurement, not from anything in the transcripts): the meter
-// moved 42% -> 87%, i.e. 45 points, while the transcripts covering that exact
-// span summed to 55.0M tokens across the two sessions that were running.
+// from a separate measurement, not from anything in the transcripts), starting
+// from a true 0% with exactly one session running and complete transcripts:
 //
-// That gives ~1.22M tokens per point, which independently reproduces the
-// earlier `/usage`-calibrated figure of 1.23M to 99.4%. Two unrelated methods
-// agreeing to better than a percent is why this is used as the unit.
+//   fit on the 1-19% range, then extrapolate to 40%   -> mean error
+//     output tokens                                      3.4%
+//     total tokens                                      13.4%
+//     API duration                                      43.6%
 //
-// Deliberately UNWEIGHTED — every token type counts the same. An attempt to fit
-// per-type weights (output 25x, cache write 12.5x, ...) failed validation badly:
-// it was calibrated on per-session meter deltas, but the meter is account-wide,
-// so with two sessions live each delta was driven by both while being charged to
-// one. That inflated the implied per-token cost ~14x. The unweighted sum tracks
-// the meter to ~1%; do not "improve" it with price weights without re-measuring
-// against a whole window with a known reset time.
-const QUOTA_TOKENS_PER_PERCENT = 1_222_502;
+//   predicting the window's final meter reading from transcripts alone:
+//     output tokens (this constant)   43.6% vs 41% actual   ->  6.5% error
+//     total tokens (previous model)   15.1% vs 41% actual   -> 63.3% error
+//
+// Cross-checked on a second, messier window (two concurrent sessions, unknown
+// starting offset, so deltas only, 57 points spanned): 2,345 output tokens per
+// point against the clean window's 2,549 — 8% apart, where the total-token
+// model disagreed with itself by 90% between the same two windows. A quantity
+// that is stable across windows is a unit; one that doubles is not.
+//
+// The pooled figure is ~2,428 output tokens per point, i.e. a 5-hour window is
+// roughly 243k output tokens.
+//
+// Why the old total-token model looked right for so long: cache read is
+// 94-99.5% of every turn and scales with output over a long session, so
+// `total` and `output` correlate strongly *within* one window. They diverge
+// across windows with different context sizes, which is exactly where the old
+// constant broke. Do not re-derive this from total tokens; the correlation is
+// real but it is not causal.
+//
+// Compaction needs NO separate term. Across the one compaction in the clean
+// window the model's residual *improved* (-3.40 -> -0.81 points): the meter did
+// not jump. Compaction is billed as input, and input is not what is metered.
+const QUOTA_OUTPUT_TOKENS_PER_PERCENT = 2_428;
 
-// Every token that crosses the model counts, including cache reads: a cache
-// read is ~10x cheaper than fresh input but still has to be pushed through the
-// model, which is what the 5-hour limit meters. This is the same quantity the
-// token stack already plots, so usage mode reuses `total` rather than
-// recomputing it.
+// Usage mode plots output tokens only — not the full stack the token view
+// shows. A cache read is pushed through the model but does not move the 5-hour
+// meter, so counting it here would be measuring the wrong thing (and did: the
+// previous unweighted-total unit was off by 63%).
 
 // Classify a session by the TTL of its cache writes.
 //
@@ -810,9 +828,14 @@ function renderSessionDetail(session, events) {
       ? STACK.map(() => 0)
       : STACK.map((s) => (e.cost && e.cost[s.cost]) || 0);
     const costTotal = costs.reduce((a, b) => a + b, 0);
+    // Output tokens only — see QUOTA_OUTPUT_TOKENS_PER_PERCENT. A compaction
+    // emits a summary, and that summary is its entire metered footprint: the
+    // context it *reads* is input, which the 5-hour meter does not count. So
+    // `postTokens` (the summary written) is the bar, and `preTokens` (the
+    // context consumed) deliberately is not.
     const usageTotal = compaction
-      ? (e.preTokens || 0) + (e.postTokens || 0)
-      : parts.reduce((a, b) => a + b, 0);
+      ? e.postTokens || 0
+      : (e.usage && e.usage.outputTokens) || 0;
     // Accumulated from the first call of the session, not the first visible
     // one: "spent so far" is a property of the session, so zooming into a
     // later window must not restart the total at zero.
@@ -867,11 +890,11 @@ function renderSessionDetail(session, events) {
   //    50x the price of a cache-read token on Opus, so the expensive-but-thin
   //    bands rise into view on their own merits, and the chart answers "where
   //    did the money go" rather than "where did the tokens go".
-  //  - usage: the same token quantity as the token view, but read as *area*
-  //    rather than height, and with compactions added. The 5-hour limit meters
-  //    every token that crosses the model regardless of type, so unlike cost
-  //    mode this one deliberately does not reweight the bands — see
-  //    QUOTA_TOKENS_PER_PERCENT.
+  //  - usage: OUTPUT tokens only, read as *area* rather than height, and with
+  //    compactions added. Not the same quantity as the token view: the 5-hour
+  //    meter tracks generation, not throughput, so cache reads are excluded
+  //    entirely even though they dominate every other view — see
+  //    QUOTA_OUTPUT_TOKENS_PER_PERCENT.
   const costMode = detailMode === 'cost';
 
   const W = Math.max(host.clientWidth || 720, 320);
@@ -899,12 +922,13 @@ function renderSessionDetail(session, events) {
   // rate and a clipped bar still reads as "off the top" — but usage mode's
   // contract is that *area is quota*, and a clipped bar silently destroys area.
   //
-  // A compaction re-reads a whole context in one event, so its bar is routinely
-  // several times the tallest ordinary turn and would flatten everything else.
-  // Instead of cutting the height, spread it sideways: draw the bar `spread`
-  // bands wide at 1/`spread` of the height. Area — and therefore the square
-  // count — is exactly preserved, while the peak comes down to something the
-  // shared axis can hold.
+  // A compaction writes a whole summary in one event, so its bar can exceed the
+  // tallest ordinary turn and would flatten everything else. Instead of cutting
+  // the height, spread it sideways: draw the bar `spread` bands wide at
+  // 1/`spread` of the height. Area — and therefore the square count — is
+  // exactly preserved, while the peak comes down to something the shared axis
+  // can hold. In practice a summary is a few thousand output tokens, comparable
+  // to a long turn, so `spread` is usually 1; it exists for the outliers.
   const usageValues = points
     .filter((p) => !p.compaction)
     .map((p) => p.usageTotal)
@@ -983,7 +1007,7 @@ function renderSessionDetail(session, events) {
     // meter that only ever reports whole percent. There is no ladder to search,
     // so no score: if a 1% cell doesn't fit the plot, `gridFits` drops the grid
     // rather than substituting a unit nobody wants.
-    const value = QUOTA_TOKENS_PER_PERCENT;
+    const value = QUOTA_OUTPUT_TOKENS_PER_PERCENT;
     moneyGrid = { value, side: Math.sqrt(value * pxPerCall * pxPerToken), score: 0, frac: 1 };
   }
 
@@ -1090,7 +1114,7 @@ function renderSessionDetail(session, events) {
   // the whole point, and "14.2%" answers it directly where "17.4M" needs the
   // unit applied by hand.
   const fmtCum = usageMode
-    ? (v) => (v / QUOTA_TOKENS_PER_PERCENT).toFixed(1) + '%'
+    ? (v) => (v / QUOTA_OUTPUT_TOKENS_PER_PERCENT).toFixed(1) + '%'
     : (v) => '$' + v.toFixed(cumDp);
 
   for (const t of ticks) {
@@ -1405,7 +1429,7 @@ function renderSessionDetail(session, events) {
     return ['Time', fmtClock(p.e.timestamp) + (gap ? ` · +${gap}` : '')];
   };
 
-  const pctOf = (v) => (v / QUOTA_TOKENS_PER_PERCENT).toFixed(2) + '% of a 5-hour window';
+  const pctOf = (v) => (v / QUOTA_OUTPUT_TOKENS_PER_PERCENT).toFixed(2) + '% of a 5-hour window';
 
   const tipRows = (p, idx) => {
     // A compaction has no token-type stack to describe, so it gets its own rows
@@ -1414,9 +1438,9 @@ function renderSessionDetail(session, events) {
       return [
         whenRow(p),
         ['Event', 'Compaction' + (p.e.trigger ? ` (${p.e.trigger})` : '')],
-        ['Context summarized', fmtInt(p.e.preTokens || 0) + ' tok'],
-        ['Summary produced', fmtInt(p.e.postTokens || 0) + ' tok'],
-        ['Usage', `${fmtInt(p.usageTotal)} tok · ${pctOf(p.usageTotal)}`],
+        ['Context summarized', fmtInt(p.e.preTokens || 0) + ' tok (input — not metered)'],
+        ['Summary produced', fmtInt(p.e.postTokens || 0) + ' tok (output)'],
+        ['Quota', pctOf(p.usageTotal)],
         ['Used so far', pctOf(p.cumUsage)],
       ];
     }
@@ -1433,7 +1457,7 @@ function renderSessionDetail(session, events) {
         ? ['Call cost', fmtExactUSD(p.costTotal) + (p.costTotal > costCeiling ? ' (clipped)' : '')]
         : ['Context window', fmtInt(p.ctx) + ' tok'],
       ...(usageMode
-        ? [['Usage', `${fmtInt(p.usageTotal)} tok · ${pctOf(p.usageTotal)}`],
+        ? [['Quota', `${fmtInt(p.usageTotal)} output tok · ${pctOf(p.usageTotal)}`],
            ['Used so far', pctOf(p.cumUsage)]]
         : [['Spent so far', fmtExactUSD(p.cum)]]),
       ['Model', p.e.modelLabel || '—'],
@@ -1578,11 +1602,11 @@ function renderSessionDetail(session, events) {
   if (gridFits) {
     if (usageMode) {
       gridNote.textContent =
-        `Each square is 1% of a 5-hour window (~${compact(moneyGrid.value)} tokens) — ` +
+        `Each square is 1% of a 5-hour window (~${compact(moneyGrid.value)} output tokens) — ` +
         (useBars
           ? 'measured per column band, not the drawn bar width. '
           : 'count the squares under the curve. ') +
-        'Compaction bars are widened and flattened in proportion, so their area still counts.';
+        'Output only: the 5-hour meter tracks generation, so cache reads are excluded.';
     } else {
       gridNote.textContent = useBars
         ? 'Each square is one unit of spend — measured per column band, not the drawn bar width.'
@@ -1596,7 +1620,7 @@ function renderSessionDetail(session, events) {
     ).join('') +
     `<span class="item"><span class="swatch" style="background:var(--cumulative)"></span>` +
     (usageMode
-      ? `Used so far — right axis (${(cumHi / QUOTA_TOKENS_PER_PERCENT).toFixed(1)}% of a 5-hour window)`
+      ? `Used so far — right axis (${(cumHi / QUOTA_OUTPUT_TOKENS_PER_PERCENT).toFixed(1)}% of a 5-hour window)`
       : `Spent so far — right axis (${fmtExactUSD(cumHi)})`) +
     '</span>' +
     (inRange.length
@@ -1635,7 +1659,7 @@ function renderSessionDetail(session, events) {
     (costMode
       ? '<th class="num">Call cost</th>'
       : usageMode
-        ? '<th class="num">Usage</th><th class="num">% window</th>'
+        ? '<th class="num">Output</th><th class="num">% window</th>'
         : '<th class="num">Context</th><th class="num">Cost</th>') +
     '</tr></thead><tbody>' +
     points.slice(-40).map((p) =>
@@ -1653,7 +1677,7 @@ function renderSessionDetail(session, events) {
         ? `<td class="num">${fmtExactUSD(p.costTotal)}</td>`
         : usageMode
           ? `<td class="num">${fmtInt(p.usageTotal)}</td>` +
-            `<td class="num">${(p.usageTotal / QUOTA_TOKENS_PER_PERCENT).toFixed(2)}%</td>`
+            `<td class="num">${(p.usageTotal / QUOTA_OUTPUT_TOKENS_PER_PERCENT).toFixed(2)}%</td>`
           : `<td class="num">${fmtInt(p.ctx)}</td>` +
             `<td class="num">${fmtExactUSD((p.e.cost && p.e.cost.total) || 0)}</td>`) +
       '</tr>',
@@ -1663,26 +1687,25 @@ function renderSessionDetail(session, events) {
 
 // --- Quota weight: the session measured against a 5-hour window -------------
 //
-// Cost and quota are different meters. A cache-read token is ~10x cheaper than
-// fresh input but still has to be pushed through the model, so a session can
-// run up a large share of the rolling 5-hour limit while costing very little.
-// The dollar charts above cannot show that; this panel is the same session
-// counted in the unit the limit is actually spent in.
+// Cost and quota are different meters, but not in the way this panel used to
+// claim. The 5-hour limit tracks OUTPUT tokens — generation, not throughput —
+// so a session that reads enormous cached contexts can cost real money while
+// barely moving the meter. The dollar charts above cannot show that; this panel
+// is the same session counted in the unit the limit is actually spent in.
 //
-// CALIBRATION — an estimate, but one checked against a matched reading.
-// `/usage` reported 95% consumed at a moment when this project's transcripts
-// summed to 1,165,150 tokens for the calls inside that window, implying a
-// window near 1.23m tokens. The two accountings agree closely enough that
-// summed transcript tokens look like the right quantity to measure.
+// CALIBRATION — measured against windows with known boundaries. See
+// QUOTA_OUTPUT_TOKENS_PER_PERCENT for the evidence and the holdout tests; this
+// panel shares that unit rather than keeping a second one.
 //
-// Still assumes every token type counts equally toward the limit, which is
-// unverified — Anthropic does not document the metering, and the dashboard has
-// no access to account-level usage state. It also cannot see sessions outside
-// the watched projects directory, so the figure is a floor, not a total.
+// This previously used a 1.23m *total*-token window calibrated against a single
+// `/usage` reading. That figure was wrong: total tokens correlate with output
+// within one window, so it validated locally, but it disagreed with itself by
+// 90% across two windows and mispredicted a clean window's final reading by
+// 63%. Do not reintroduce a total-token unit here.
 //
-// To recalibrate: compare the percentage below against `/usage` in the same
-// window and set WINDOW_TOKENS = tokens / (percent / 100).
-const WINDOW_TOKENS = 1_230_000;
+// The dashboard cannot see sessions outside the watched projects directory, and
+// the meter is account-wide, so the figure remains a floor, not a total.
+const WINDOW_OUTPUT_TOKENS = QUOTA_OUTPUT_TOKENS_PER_PERCENT * 100;
 
 // The panel measures a trailing 5-hour span rather than the whole session.
 // Sessions routinely straddle a window reset — summing one end to end reports
@@ -1691,13 +1714,11 @@ const WINDOW_TOKENS = 1_230_000;
 // five hours of activity: correct whenever a window's worth of work is recent,
 // and never inventing a boundary it cannot know.
 const WINDOW_MS = 5 * 60 * 60 * 1000;
-const QUOTA_SQUARE_TOKENS = WINDOW_TOKENS / 100; // one square = 1% of a window
+const QUOTA_SQUARE_TOKENS = QUOTA_OUTPUT_TOKENS_PER_PERCENT; // one square = 1%
 
-// Every token that crosses the model counts the same here. Deliberately not
-// weighted by price — that is what the cost charts are for.
-const quotaTokensOf = (u) =>
-  (u.inputTokens || 0) + (u.cacheReadTokens || 0) +
-  (u.cacheCreationTokens || 0) + (u.outputTokens || 0);
+// Output only. Input, cache reads and cache writes are all billed, but none of
+// them move the 5-hour meter — see QUOTA_OUTPUT_TOKENS_PER_PERCENT.
+const quotaTokensOf = (u) => u.outputTokens || 0;
 
 function renderQuota(session, events) {
   const host = el('quota-chart');
@@ -1736,12 +1757,13 @@ function renderQuota(session, events) {
     (Date.parse(calls[calls.length - 1].timestamp) - Date.parse(calls[0].timestamp)) / 60000;
   el('quota-sub').textContent =
     `${fmtInt(calls.length)} calls over ${span < 60 ? Math.round(span) + 'm' : (span / 60).toFixed(1) + 'h'} · ` +
-    `${compact(totalTokens)} tokens through the model — one square is 1% of a 5-hour window.`;
+    `${compact(totalTokens)} output tokens — one square is 1% of a 5-hour window.`;
   el('quota-total').innerHTML =
     `${totalPct.toFixed(1)}%<span class="headline-label">of a 5-hour window</span>`;
   el('quota-note').textContent =
-    `Estimated: 1 square ≈ ${compact(QUOTA_SQUARE_TOKENS)} tokens, from a ` +
-    `${compact(WINDOW_TOKENS)}-token window calibrated against /usage. ` +
+    `Estimated: 1 square ≈ ${compact(QUOTA_SQUARE_TOKENS)} output tokens, from a ` +
+    `${compact(WINDOW_OUTPUT_TOKENS)}-output-token window measured against known ` +
+    'window boundaries. The meter tracks generation, so cache reads are excluded. ' +
     'Counts this session only, over the trailing 5 hours' +
     (excluded ? ` (${fmtInt(excluded)} earlier calls excluded).` : '.');
 
