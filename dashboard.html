@@ -305,23 +305,6 @@
     </div>
   </details>
 
-  <details class="card panel" id="quota-card" open>
-    <summary><h2>Quota weight</h2></summary>
-    <div class="panel-body">
-      <div class="detail-head">
-        <p class="sub" id="quota-sub"></p>
-        <p class="headline" id="quota-total"></p>
-      </div>
-      <p class="sub grid-note" id="quota-note"></p>
-      <div id="quota-chart"><p class="empty">Loading…</p></div>
-      <div class="legend" id="quota-legend"></div>
-      <details>
-        <summary class="minor">Table view — cumulative quota by call</summary>
-        <div class="scroll"><table id="quota-table"></table></div>
-      </details>
-    </div>
-  </details>
-
   <div class="row two">
     <details class="card panel">
       <summary><h2>Spend per day</h2></summary>
@@ -915,10 +898,6 @@ function detailCallCount() {
 // --- Stacked columns / area: context window over a session ------------------
 function renderSessionDetail(session, events) {
   detailData = { session, events };
-  // The quota panel plots the same session in a different unit, so it follows
-  // this render rather than being wired into every call site separately. It
-  // ignores mode and zoom, so a re-render for either is cheap and idempotent.
-  if (panelOpen('quota-chart')) renderQuota(session, events);
   for (const b of el('detail-modes').querySelectorAll('button[data-mode]')) {
     b.setAttribute('aria-pressed', String(b.dataset.mode === detailMode));
   }
@@ -1898,182 +1877,6 @@ function renderSessionDetail(session, events) {
     '</tbody>');
 }
 
-// --- Quota weight: the session measured against a 5-hour window -------------
-//
-// Cost and quota are different meters, but not in the way this panel used to
-// claim. The 5-hour limit tracks OUTPUT tokens — generation, not throughput —
-// so a session that reads enormous cached contexts can cost real money while
-// barely moving the meter. The dollar charts above cannot show that; this panel
-// is the same session counted in the unit the limit is actually spent in.
-//
-// CALIBRATION — measured against windows with known boundaries. See
-// QUOTA_OUTPUT_TOKENS_PER_PERCENT for the evidence and the holdout tests; this
-// panel shares that unit rather than keeping a second one.
-//
-// This previously used a 1.23m *total*-token window calibrated against a single
-// `/usage` reading. That figure was wrong: total tokens correlate with output
-// within one window, so it validated locally, but it disagreed with itself by
-// 90% across two windows and mispredicted a clean window's final reading by
-// 63%. Do not reintroduce a total-token unit here.
-//
-// The dashboard cannot see sessions outside the watched projects directory, and
-// the meter is account-wide, so the figure remains a floor, not a total.
-
-// The panel measures a trailing 5-hour span rather than the whole session.
-// Sessions routinely straddle a window reset — summing one end to end reports
-// things like 240% of a window, which is not a quantity that exists. Where the
-// real boundaries fall is not in the transcript data, so this counts the last
-// five hours of activity: correct whenever a window's worth of work is recent,
-// and never inventing a boundary it cannot know.
-const WINDOW_MS = 5 * 60 * 60 * 1000;
-const QUOTA_SQUARE_TOKENS = QUOTA_OUTPUT_TOKENS_PER_PERCENT; // one square = 1%
-
-// Output plus cache write, in output-token equivalents. Cache reads are billed
-// but do not move the meter — see QUOTA_OUTPUT_TOKENS_PER_PERCENT.
-const quotaTokensOf = (u) =>
-  quotaEquivOf(u.outputTokens || 0, u.cacheCreationTokens || 0);
-
-function renderQuota(session, events) {
-  const host = el('quota-chart');
-  const all = events
-    .filter((e) => e.kind === 'chat_completion' && e.timestamp)
-    .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-  // Anchored to the last call rather than to `now`, so an old session still
-  // shows the window it actually ran in instead of an empty grid.
-  const anchor = all.length ? Date.parse(all[all.length - 1].timestamp) : 0;
-  const calls = all.filter((e) => anchor - Date.parse(e.timestamp) < WINDOW_MS);
-  const excluded = all.length - calls.length;
-
-  if (!calls.length) {
-    el('quota-sub').textContent = '';
-    el('quota-total').textContent = '';
-    el('quota-note').textContent = '';
-    el('quota-legend').innerHTML = '';
-    setTableHTML(el('quota-table'), '');
-    setChildren(host, emptyNote('No model calls in this session.'));
-    return;
-  }
-
-  // Cumulative, in the same call order as the session chart above.
-  let running = 0;
-  const points = calls.map((e, i) => {
-    const tokens = quotaTokensOf(e.usage);
-    running += tokens;
-    return { i, e, tokens, cum: running, pct: running / QUOTA_SQUARE_TOKENS };
-  });
-
-  const totalTokens = running;
-  const totalPct = totalTokens / QUOTA_SQUARE_TOKENS;
-
-  const span =
-    (Date.parse(calls[calls.length - 1].timestamp) - Date.parse(calls[0].timestamp)) / 60000;
-  el('quota-sub').textContent =
-    `${fmtInt(calls.length)} calls over ${span < 60 ? Math.round(span) + 'm' : (span / 60).toFixed(1) + 'h'} · ` +
-    `${compact(totalTokens)} output tokens — one square is 1% of a 5-hour window.`;
-  el('quota-total').innerHTML =
-    `${totalPct.toFixed(1)}%<span class="headline-label">of a 5-hour window</span>`;
-  el('quota-note').textContent =
-    `Estimated: 1 square ≈ ${compact(QUOTA_SQUARE_TOKENS)} output tokens or ` +
-    `${compact(QUOTA_CACHE_WRITE_TOKENS_PER_PERCENT)} cache-write tokens, measured ` +
-    'against known window boundaries. Cache reads are not metered. ' +
-    `Calibrated on ${QUOTA_CALIBRATION_LABEL}. ` +
-    'Counts this session only, over the trailing 5 hours' +
-    (excluded ? ` (${fmtInt(excluded)} earlier calls excluded).` : '.');
-
-  // Squares accrue left to right, wrapping into rows of 20 — a fifth of a
-  // window per row, so a full window is five rows and the eye can count it
-  // without a scale. Past 100 the grid keeps going rather than capping: the
-  // panel does not know where the real window boundaries fall, so pretending
-  // it fills up and stops would be a claim it cannot support.
-  const PER_ROW = 20;
-  const filled = Math.floor(totalPct);
-  const partial = totalPct - filled;
-  const rows = Math.max(5, Math.ceil(totalPct / PER_ROW) || 1);
-  const W = Math.max(host.clientWidth || 720, 320);
-  const pad = 2;
-  const side = Math.min(28, Math.floor((W - pad * (PER_ROW - 1)) / PER_ROW));
-  const gridW = side * PER_ROW + pad * (PER_ROW - 1);
-  const H = rows * (side + pad) + 8;
-
-  const svg = svgEl('svg', { viewBox: `0 0 ${gridW} ${H}`, height: H });
-
-  const cell = (n) => ({ cx: (n % PER_ROW) * (side + pad), cy: Math.floor(n / PER_ROW) * (side + pad) });
-
-  // Empty slots for the first five rows, so an under-full window still reads
-  // as a proportion of something rather than a bare row of squares.
-  for (let n = 0; n < Math.max(100, rows * PER_ROW); n++) {
-    const { cx, cy } = cell(n);
-    svg.appendChild(svgEl('rect', {
-      x: cx, y: cy, width: side, height: side, rx: 2,
-      fill: 'none', stroke: 'var(--grid)', 'stroke-width': 1,
-    }));
-  }
-
-  for (let n = 0; n < filled; n++) {
-    const { cx, cy } = cell(n);
-    svg.appendChild(svgEl('rect', {
-      x: cx, y: cy, width: side, height: side, rx: 2, fill: 'var(--quota)',
-    }));
-  }
-
-  // The remainder is drawn as a part-height square rather than rounded away:
-  // at 12k tokens a square, a rounded-off tail is real usage.
-  if (partial > 0.02) {
-    const { cx, cy } = cell(filled);
-    const h = Math.max(1, side * partial);
-    svg.appendChild(svgEl('rect', {
-      x: cx, y: cy + (side - h), width: side, height: h, rx: 2,
-      fill: 'var(--quota)', 'fill-opacity': 0.55,
-    }));
-  }
-
-  // The 100% boundary, drawn only once there is something on the far side of
-  // it — otherwise the fifth row's outline already marks it.
-  if (totalPct > 100) {
-    const y100 = 5 * (side + pad) - pad / 2;
-    svg.appendChild(svgEl('line', {
-      x1: 0, x2: gridW, y1: y100, y2: y100,
-      stroke: 'var(--critical)', 'stroke-width': 1.5, 'stroke-dasharray': '4 3',
-    }));
-  }
-
-  const hit = svgEl('rect', {
-    x: 0, y: 0, width: gridW, height: H, fill: 'transparent',
-  });
-  hit.addEventListener('mousemove', (e) =>
-    showTip(e, 'Quota weight', [
-      ['Share of window', totalPct.toFixed(1) + '%'],
-      ['Tokens', fmtInt(totalTokens)],
-      ['Squares', fmtInt(filled) + ' full'],
-      ['Per square', compact(QUOTA_SQUARE_TOKENS) + ' tok'],
-      ['Session cost', fmtUSD(session.totals.cost)],
-    ]));
-  hit.addEventListener('mouseleave', hideTip);
-  svg.appendChild(hit);
-
-  setChildren(host, svg);
-
-  el('quota-legend').innerHTML =
-    `<span class="item"><span class="swatch" style="background:var(--quota)"></span>` +
-    '1% of a 5-hour window</span>';
-
-  // Last 40 calls, matching the session table above, with the running share so
-  // the squares are readable as numbers too.
-  const shown = points.slice(-40);
-  setTableHTML(el('quota-table'),
-    '<thead><tr><th class="num">#</th><th>Time</th><th>Model</th>' +
-    '<th class="num">Tokens</th><th class="num">Cumulative</th><th class="num">Window %</th>' +
-    '</tr></thead><tbody>' +
-    shown.map((p) =>
-      `<tr><td class="num">${p.i + 1}</td><td>${fmtClock(p.e.timestamp)}</td>` +
-      `<td>${p.e.modelLabel || '—'}</td>` +
-      `<td class="num">${fmtInt(p.tokens)}</td>` +
-      `<td class="num">${fmtInt(p.cum)}</td>` +
-      `<td class="num">${p.pct.toFixed(2)}%</td></tr>`,
-    ).join('') +
-    '</tbody>');
-}
-
 // --- Data plumbing ----------------------------------------------------------
 let stats = null;
 let sessions = [];
@@ -2150,11 +1953,16 @@ const panelOpen = (id) => {
   return !panel || panel.open;
 };
 
-function renderAll() {
+// `detail` opts out of the session breakdown for callers that are about to
+// render it themselves from freshly fetched events — otherwise a refresh draws
+// it twice, the first time from the stale cached payload.
+function renderAll({ detail = true } = {}) {
   if (panelOpen('daily')) renderDaily(stats.daily);
-  // Quota rides along here so resize and theme changes re-lay it out; it draws
-  // from the cached session payload, not from `stats`.
-  if (detailData && panelOpen('quota-chart')) renderQuota(detailData.session, detailData.events);
+  // The session breakdown rides along here so resize and theme changes re-lay
+  // it out; it draws from the cached session payload, not from `stats`.
+  if (detail && detailData && panelOpen('detail-chart')) {
+    renderSessionDetail(detailData.session, detailData.events);
+  }
 
   if (panelOpen('models')) renderBars('models', 'models-table', stats.models, {
     value: (m) => m.cost,
@@ -2200,7 +2008,10 @@ async function refresh() {
   // measuring across the await would compare against a layout that a paint has
   // already invalidated. `preserveScroll` is a no-op at the top of the page,
   // which is where a passive viewer usually sits.
-  preserveScroll(renderAll);
+  //
+  // The breakdown is skipped in the first pass and drawn in the second, from
+  // the events this refresh just fetched rather than the cached ones.
+  preserveScroll(() => renderAll({ detail: !selectedId }));
 
   if (selectedId) {
     const res = await fetch(`/api/sessions/${encodeURIComponent(selectedId)}`);
@@ -2244,10 +2055,6 @@ for (const panel of document.querySelectorAll('.panel')) {
     if (!panel.open) return;
     if (panel.id === 'detail-card') {
       if (detailData) renderSessionDetail(detailData.session, detailData.events);
-    } else if (panel.id === 'quota-card') {
-      // Same session payload as the breakdown, so it re-renders from the cache
-      // rather than needing a fetch.
-      if (detailData) renderQuota(detailData.session, detailData.events);
     } else if (stats) {
       renderAll();
     }
