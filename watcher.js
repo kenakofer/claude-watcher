@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 //
-// claude-session-watcher
+// claude-watcher
 //
 // Tails Claude Code's per-session JSONL transcripts under ~/.claude/projects,
 // normalizes them into a flat event stream (prompt, chat_completion,
@@ -43,7 +43,7 @@ function parseArgs(argv) {
   return opts;
 }
 
-const HELP = `claude-session-watcher
+const HELP = `claude-watcher
 
   node watcher.js [--projects <dir>] [--port <n>] [--host <addr>] [--poll <ms>]
 

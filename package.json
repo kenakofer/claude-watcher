@@ -1,5 +1,5 @@
 {
-  "name": "claude-session-watcher",
+  "name": "claude-watcher",
   "version": "0.1.0",
   "description": "Tails Claude Code session transcripts and serves normalized token usage, cost, tool calls, and compaction events to a live dashboard.",
   "type": "module",

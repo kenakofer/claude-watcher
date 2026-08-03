@@ -1,4 +1,4 @@
-# claude-session-watcher
+# claude-watcher
 
 A local, zero-dependency dashboard for Claude Code token usage and cost.
 
