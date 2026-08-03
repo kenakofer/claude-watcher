@@ -1384,7 +1384,14 @@ function renderSessionDetail(session, events) {
       class: 'grid-line', x1: m.left, x2: m.left + plotW, y1: gy, y2: gy,
     }));
     const label = svgEl('text', { class: 'tick', x: m.left - 8, y: gy + 4, 'text-anchor': 'end' });
-    label.textContent = costMode ? fmtLeft(t) : compact(t);
+    // Token mode is the only one whose axis is actually a token count, so it is
+    // the only one that gets `compact`. Cost and usage both carry a unit their
+    // own formatter applies — dollars, or percent of a 5-hour window — and usage
+    // used to fall through to `compact` here, which printed the internal
+    // output-token-equivalent figure ("1.2k") on an axis whose quantity is
+    // percent. The number was not wrong so much as unlabelled in a unit nobody
+    // reads the meter in.
+    label.textContent = usageMode || costMode ? fmtLeft(t) : compact(t);
     svg.appendChild(label);
 
     // Same gridline, right-hand side: the cumulative value at that height.
