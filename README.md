@@ -23,8 +23,8 @@ projects, and how your context window behaves across a long session.
 Requires Node.js 18+. No `npm install` — there are no dependencies.
 
 ```bash
-git clone https://github.com/<you>/claude-session-watcher
-cd claude-session-watcher
+git clone https://github.com/kenakofer/claude-watcher
+cd claude-watcher
 node watcher.js
 ```
 
