@@ -771,6 +771,31 @@ const MIN_BAR_BAND_PX = 5;
 // that further zoom just adds whitespace without revealing anything.
 const MIN_ZOOM_CALLS = 4;
 
+// --- Outlier folding (usage mode) -------------------------------------------
+//
+// A single turn can draw 30x the median — one re-cache of a huge context, or a
+// long generation — which on a shared axis flattens every ordinary turn onto the
+// baseline. Clipping is not available here: usage mode's contract is that a
+// bar's *area* is its quota draw, and clipping destroys area silently.
+//
+// So a tall turn is folded into N equal slices laid side by side, each 1/N as
+// tall. Width x height is unchanged, so the ink is exactly conserved and the
+// money grid still reads true — the bar is rewrapped, not rescaled.
+//
+// Fold only when the peak exceeds the median by this much; below it the session
+// has no outlier to correct and folding would be noise.
+const FOLD_TRIGGER = 3;
+// Where the axis ceiling lands, as a multiple of the median. Same number as the
+// trigger, so any turn that qualifies as an outlier is also one that folds at
+// least in two, and there is no band of turns that trip the trigger but then sit
+// under the ceiling unfolded.
+const FOLD_HEADROOM = 3;
+// A fold this deep is a smear rather than a bar. Past it the turn keeps its true
+// height and is allowed to run off the top: at 12+ slices the column is so wide
+// it stops reading as one turn, and an honest overflow beats an unreadable one.
+// Disclosed in the legend when it happens.
+const FOLD_MAX = 12;
+
 // Clamp a proposed window to the data and to the minimum span, keeping it
 // inside [0, n]. Returns null for "the whole range", so the un-zoomed state has
 // exactly one representation and the reset button can rely on it.
@@ -1063,11 +1088,40 @@ function renderSessionDetail(session, events) {
   // rate and a clipped bar still reads as "off the top" — but usage mode's
   // contract is that *area is quota*, and a clipped bar silently destroys area.
   //
-  // The spread/cap machinery that used to live here is gone. It existed because
-  // compactions were charged their summary as output, making their bars 5-9x an
-  // ordinary turn. They are not charged at all now — the re-cache lands on the
-  // following call — so there is no oversized bar left to tame.
-  const usageCeiling = Math.max(...points.map((p) => p.usageTotal), 1);
+  // Instead it *folds*: a turn taller than the ceiling is drawn as N side-by-side
+  // slices of one Nth the height, so the ink is conserved exactly and the bar
+  // still says "this much quota" — it just says it wide instead of tall. Each
+  // slice carries a "1 of N" label so the fold is declared rather than implied.
+  //
+  // This is not the old spread/cap machinery, which widened a bar *around its own
+  // centre* and so overlapped its neighbours; it needed a cap, and a capped bar
+  // under-drew its area — the one thing this mode promises not to do. Folding
+  // consumes real slots instead (see `slots` below), so nothing overlaps, nothing
+  // is capped, and area survives at any fold depth.
+  //
+  // The ceiling is a robust typical value, not the max: the whole point is that
+  // one 30x turn must not set the scale. Median x 3 rather than mean x 3 — a few
+  // outliers drag a mean upward by exactly the amount being corrected for, so a
+  // mean-based ceiling rises to meet the outlier and folds nothing. The median is
+  // unmoved by them, which is the property wanted here.
+  //
+  // Floors at a real p98 so an all-similar session doesn't fold on noise: if the
+  // 98th percentile already sits under median x 3, nothing is an outlier and the
+  // scale is left alone.
+  const usageSorted = points.map((p) => p.usageTotal).sort((a, b) => a - b);
+  const usageMedian = usageSorted[Math.floor(usageSorted.length / 2)] || 0;
+  const usagePeak = usageSorted[usageSorted.length - 1] || 0;
+  const usageP98 = usageSorted[Math.min(usageSorted.length - 1,
+    Math.floor(usageSorted.length * 0.98))] || 0;
+  // Fold only when it buys something. A session whose peak is within 3x of its
+  // own median has no outlier problem, and folding there would trade a readable
+  // chart for a gratuitous "1 of 2".
+  const usageFolds = usageMode
+    && usageMedian > 0
+    && usagePeak > usageMedian * FOLD_TRIGGER;
+  const usageCeiling = usageFolds
+    ? Math.max(usageMedian * FOLD_HEADROOM, usageP98)
+    : Math.max(usagePeak, 1);
 
   const max = costMode
     ? costCeiling
@@ -1106,6 +1160,43 @@ function renderSessionDetail(session, events) {
   // ladder there runs over token decades instead of dollar decades, and the
   // preferred cell is one *percent of a 5-hour window* — the whole point of the
   // mode is that you can count squares to read quota consumption directly.
+  // --- Slot allocation ------------------------------------------------------
+  //
+  // Ordinarily one point is one band. A folded turn occupies N consecutive
+  // bands, so the plot is divided into total *slots* rather than points, and a
+  // point's x position comes from the running slot offset instead of its index.
+  //
+  // Sized here, ahead of the quota grid, because the grid divides by the slot
+  // count: a fold multiplies a bar's width and divides its height by the same N,
+  // so area survives, but only if the grid measures the same slots the bars are
+  // drawn in. Dividing by `points.length` while drawing in slots would inflate
+  // every square and silently break the one guarantee this mode makes.
+  //
+  // Ceil, not round: a turn at 3.2x the ceiling needs 4 slices, and 3 would
+  // leave it poking above the axis — the overflow this exists to prevent.
+  const foldOf = (p) => {
+    if (!usageFolds || p.compaction || p.usageTotal <= usageCeiling) return 1;
+    return Math.min(FOLD_MAX, Math.ceil(p.usageTotal / usageCeiling));
+  };
+  const folds = points.map(foldOf);
+  // Running start offset per point, in slots, plus the total the plot divides by.
+  // `pointAtSlot` is the inverse — which point owns a given slot — used by the
+  // area-mode hover, where the pointer lands on a slot rather than an index.
+  const slotAt = [];
+  const pointAtSlot = [];
+  let slotCount = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    slotAt.push(slotCount);
+    for (let k = 0; k < folds[i]; k += 1) pointAtSlot.push(i);
+    slotCount += folds[i];
+  }
+  const foldedCount = folds.filter((f) => f > 1).length;
+  // A fold that hit FOLD_MAX still overflows the axis; counted so the legend can
+  // say so rather than letting the bar quietly run off the top.
+  const foldOverflow = points.filter(
+    (p, i) => folds[i] > 1 && p.usageTotal / folds[i] > usageCeiling,
+  ).length;
+
   let moneyGrid = null;
   if (costMode) {
     const MONEY_GRID_TARGET_PX = 42;
@@ -1118,7 +1209,9 @@ function renderSessionDetail(session, events) {
       if (!moneyGrid || score < moneyGrid.score) moneyGrid = { value, side, score };
     }
   } else if (usageMode) {
-    const pxPerCall = plotW / points.length;
+    // Slots, not points — see the slot allocation above. This is the divisor
+    // that keeps a square worth 1% when bars are folded.
+    const pxPerCall = plotW / slotCount;
     const pxPerToken = plotH / top;
     // One rung only: 1% of a window, never a subdivision. Same reasoning as the
     // money grid's $1 floor — a square worth a tenth of a percent is well-sized
@@ -1213,13 +1306,28 @@ function renderSessionDetail(session, events) {
   // of a shrinking band, so as the band narrows the fill drops below the 70%
   // the old rule held. MIN_BAR_BAND_PX bounds that: bar mode ends once the gap
   // would cost more than 2/5 of the band.
-  const band = plotW / points.length;
+  const band = plotW / slotCount;
   const useBars = band >= MIN_BAR_BAND_PX;
   const BAR_GAP = 2;
   const barW = Math.max(1, band - BAR_GAP);
+  // The centre of a point's *whole* run of slots, so the cumulative line and the
+  // compaction markers still land on the middle of what they refer to.
+  //
+  // Both modes measure x in slots, so folding behaves identically in each. Area
+  // mode used to interpolate over point indices, which made folds invisible
+  // there: a spike stayed a spike and the ceiling it was folded under no longer
+  // matched the shape drawn against it. In slot space a folded turn occupies its
+  // full run at 1/N height, so it reads as a wide plateau — the same "spread it
+  // sideways to keep the area" gesture the bars make, in continuous form.
+  //
+  // Area mode spans edge to edge, so it interpolates across slot *centres* and
+  // stretches the ends to the plot edges; bar mode sits on band centres. The
+  // -1 divisor mirrors the original index-space formula, now over slots.
+  const slotSpan = Math.max(1, slotCount - 1);
+  const xSlot = (s) => m.left + (slotCount === 1 ? plotW / 2 : (s / slotSpan) * plotW);
   const x = useBars
-    ? (i) => m.left + band * (i + 0.5)
-    : (i) => m.left + (points.length === 1 ? plotW / 2 : (i / (points.length - 1)) * plotW);
+    ? (i) => m.left + band * (slotAt[i] + folds[i] / 2)
+    : (i) => xSlot(slotAt[i] + (folds[i] - 1) / 2);
   // Clamped so a clipped cost band stops at the plot ceiling instead of
   // drawing outside the chart area.
   const y = (v) => m.top + plotH - (Math.min(v, top) / top) * plotH;
@@ -1312,7 +1420,10 @@ function renderSessionDetail(session, events) {
     // In usage mode the compaction is already drawn as its own bar in this
     // colour, so the marker line would be a second mark for one event.
     if (usageMode) continue;
-    const mx = useBars ? m.left + band * idx : x(idx);
+    // Leading edge of the point's first slot, not of its index: with folding a
+    // point's slot offset and its index diverge, and using the index would drift
+    // the marker further left with every fold earlier in the window.
+    const mx = useBars ? m.left + band * slotAt[idx] : x(idx);
     svg.appendChild(svgEl('line', {
       x1: mx, x2: mx, y1: m.top, y2: m.top + plotH,
       stroke: 'var(--critical)', 'stroke-width': 1,
@@ -1356,7 +1467,7 @@ function renderSessionDetail(session, events) {
     expiries.push({ i, gapS, ttl: gapS > CACHE_TTL_1H_S ? '1h' : '5m' });
   }
   for (const ex of expiries) {
-    const mx = useBars ? m.left + band * ex.i : x(ex.i);
+    const mx = useBars ? m.left + band * slotAt[ex.i] : x(ex.i);
     svg.appendChild(svgEl('line', {
       x1: mx, x2: mx, y1: m.top, y2: m.top + plotH,
       stroke: 'var(--cache-expiry)', 'stroke-width': 1,
@@ -1378,17 +1489,23 @@ function renderSessionDetail(session, events) {
   // Each mode stacks its own quantity: dollars, quota-equivalents, or raw
   // tokens. Usage mode's zero-weight bands contribute nothing and are skipped
   // by the `upper <= lower` guards below, so no invisible rect is emitted.
+  //
+  // Usage mode divides every band by the point's fold, not just the total: each
+  // slice is a faithful 1/N of the whole turn, so the composition inside a slice
+  // matches the composition of the turn and the slices are interchangeable. The
+  // stack height of one slice is then usageTotal/N, which is what puts a folded
+  // turn back under the ceiling.
   const bandOf = costMode
     ? (p, si) => p.costs[si]
     : usageMode
-      ? (p, si) => p.quotas[si]
+      ? (p, si, i) => p.quotas[si] / folds[i]
       : (p, si) => p.parts[si];
   STACK.forEach((s, si) => {
     // A band that is zero everywhere draws nothing. The bar path already skips
     // it per-point; the area path would otherwise emit a zero-height sliver
     // hugging the band below and darken it through the 0.85 fill.
     if (usageMode && !s.quota) return;
-    const upper = points.map((p, i) => lower[i] + bandOf(p, si));
+    const upper = points.map((p, i) => lower[i] + bandOf(p, si, i));
 
     if (useBars) {
       // One rect per call. No inter-segment gap here (unlike the daily chart):
@@ -1402,17 +1519,48 @@ function renderSessionDetail(session, events) {
         const yTop = y(upper[i]);
         const h = y(lower[i]) - yTop;
         if (h <= 0) return;
-        svg.appendChild(svgEl('rect', {
-          x: x(i) - barW / 2, y: yTop, width: barW, height: h,
-          fill: s.color, 'fill-opacity': 0.85,
-        }));
+        // A folded turn emits one rect per slice, each in its own slot at the
+        // shared 1/N height. Drawn as separate rects rather than one wide one so
+        // the BAR_GAP falls between slices too — that gap is what makes the
+        // slices countable and stops the fold reading as a single fat bar.
+        //
+        // Centred on the slot rather than inset from its left edge, so that when
+        // `barW` hits its 1px floor on a sub-pixel band the overhang is split
+        // evenly instead of pushing the last bar past the right edge of the plot.
+        for (let k = 0; k < folds[i]; k += 1) {
+          svg.appendChild(svgEl('rect', {
+            x: m.left + band * (slotAt[i] + k + 0.5) - barW / 2, y: yTop,
+            width: barW, height: h,
+            fill: s.color, 'fill-opacity': 0.85,
+          }));
+        }
       });
     } else {
       // Forward along the top edge, back along the bottom edge.
-      const top = points.map((p, i) => `${i ? 'L' : 'M'}${x(i)},${y(upper[i])}`).join(' ');
-      const bottom = points
-        .map((p, i) => `L${x(points.length - 1 - i)},${y(lower[points.length - 1 - i])}`)
-        .join(' ');
+      //
+      // A folded point contributes a vertex at each end of its run rather than
+      // one at its centre, so its reduced height is held flat across every slot
+      // it occupies. With a single centre vertex the path would ramp straight
+      // through the plateau and the triangles lost on either side would eat
+      // exactly the area the fold was meant to preserve.
+      //
+      // Unfolded points have both ends at the same slot, so they collapse back
+      // to one vertex and the path is identical to before folding existed.
+      const verts = (row) => {
+        const out = [];
+        for (let i = 0; i < points.length; i += 1) {
+          const a = xSlot(slotAt[i]);
+          const b = xSlot(slotAt[i] + folds[i] - 1);
+          const vy = y(row[i]);
+          out.push([a, vy]);
+          if (b !== a) out.push([b, vy]);
+        }
+        return out;
+      };
+      const topV = verts(upper);
+      const botV = verts(lower).reverse();
+      const top = topV.map(([px, py], k) => `${k ? 'L' : 'M'}${px},${py}`).join(' ');
+      const bottom = botV.map(([px, py]) => `L${px},${py}`).join(' ');
 
       svg.appendChild(svgEl('path', {
         d: `${top} ${bottom} Z`, fill: s.color, 'fill-opacity': 0.85, stroke: 'none',
@@ -1421,6 +1569,63 @@ function renderSessionDetail(session, events) {
 
     for (let i = 0; i < points.length; i += 1) lower[i] = upper[i];
   });
+
+  // --- Fold labels ----------------------------------------------------------
+  //
+  // A fold is only honest if it is declared: without a label, five slices read
+  // as five ordinary turns and the chart lies about the call count. "1 of 5" on
+  // each slice says both that this is one turn and how much of it you are
+  // looking at, so the total is recoverable by eye (slice height x N).
+  //
+  // Labels sit just above the slice's own top edge, and are dropped when the
+  // slot is too narrow to hold the text — a clipped "1 o…" is worse than the
+  // bracket alone, which still groups the slices visually.
+  //
+  // Both modes label the same way, off the same slot geometry; only the edges
+  // differ. Bars own a band each and are inset by the gap that separates them;
+  // the area path has no gaps, so its run is measured centre to centre and the
+  // tie bar sits flush with the plateau it spans.
+  if (usageMode && foldedCount) {
+    // Per-slot width available to a label, which is what decides whether the
+    // text fits — the band in bar mode, the slot pitch in area mode.
+    const slotPitch = useBars ? band : plotW / slotSpan;
+    points.forEach((p, i) => {
+      const n = folds[i];
+      if (n < 2) return;
+      const yTop = y(p.usageTotal / n);
+      // Flush with the outer edges of the first and last slice, matching how
+      // those rects are centred on their slots.
+      const runL = useBars
+        ? m.left + band * (slotAt[i] + 0.5) - barW / 2
+        : xSlot(slotAt[i]);
+      const runR = useBars
+        ? m.left + band * (slotAt[i] + n - 0.5) + barW / 2
+        : xSlot(slotAt[i] + n - 1);
+      // ~7px per character at this size; below that the label overlaps its
+      // neighbour and the slot number is unreadable anyway.
+      const fits = slotPitch >= `${n} of ${n}`.length * 7;
+      // A tie bar across the whole run, so the slices read as one turn even
+      // where the per-slice labels have been dropped for width.
+      svg.appendChild(svgEl('line', {
+        x1: runL, x2: runR, y1: yTop - 4, y2: yTop - 4,
+        stroke: 'var(--text-secondary)', 'stroke-width': 1, 'stroke-opacity': 0.5,
+      }));
+      if (!fits) return;
+      for (let k = 0; k < n; k += 1) {
+        const label = svgEl('text', {
+          class: 'tick',
+          x: useBars
+            ? m.left + band * (slotAt[i] + k + 0.5)
+            : xSlot(slotAt[i] + k),
+          y: yTop - 8,
+          'text-anchor': 'middle',
+          'pointer-events': 'none',
+        });
+        label.textContent = `${k + 1} of ${n}`;
+        svg.appendChild(label);
+      }
+    });
+  }
 
   // --- Compaction markers (usage mode) ---------------------------------------
   //
@@ -1448,7 +1653,19 @@ function renderSessionDetail(session, events) {
   // the context window; in cost mode it is the per-call total spend. Columns
   // carry their own edges, so this is area mode only.
   if (!useBars) {
-    const outline = points.map((p, i) => `${i ? 'L' : 'M'}${x(i)},${y(lower[i])}`).join(' ');
+    // Traces the same plateaus as the fill below it — two vertices across a
+    // folded run, one otherwise. Deriving it from `x(i)` instead would cut the
+    // corners the fill draws square and leave the outline floating off the top
+    // edge of its own area.
+    const outline = points
+      .flatMap((p, i) => {
+        const a = xSlot(slotAt[i]);
+        const b = xSlot(slotAt[i] + folds[i] - 1);
+        const vy = y(lower[i]);
+        return b !== a ? [[a, vy], [b, vy]] : [[a, vy]];
+      })
+      .map(([px, py], k) => `${k ? 'L' : 'M'}${px},${py}`)
+      .join(' ');
     svg.appendChild(svgEl('path', {
       d: outline, fill: 'none', stroke: 'var(--text-primary)',
       'stroke-width': 1, 'stroke-opacity': 0.35, 'stroke-linejoin': 'round',
@@ -1623,7 +1840,13 @@ function renderSessionDetail(session, events) {
             fmtExactUSD(p.costTotal) + (p.costTotal > costCeiling ? ' (clipped)' : '')],
            ['Spent so far', fmtExactUSD(p.cum)]]
         : usageMode
-          ? [['Quota', pctOf(p.usageTotal)],
+          ? [['Quota', pctOf(p.usageTotal)
+              // The bar is drawn short by design here, so the tooltip says so
+              // and gives the height one slice actually represents — otherwise
+              // the figure above and the ink on screen appear to disagree.
+              + (folds[idx] > 1
+                ? ` — drawn as ${folds[idx]} slices of ${barePct(p.usageTotal / folds[idx])}`
+                : '')],
              ['Used so far', pctOf(p.cumUsage)]]
           : [['Context window', fmtInt(p.ctx) + ' tok'],
              ['Spent so far', fmtExactUSD(p.cum)]]),
@@ -1635,8 +1858,11 @@ function renderSessionDetail(session, events) {
     // A hit target per band, so hovering a column never demands pixel
     // precision against the gap next to it.
     points.forEach((p, idx) => {
+      // Spans the point's whole run of slots, so a folded turn is one hover
+      // target: its slices are one call and must report one tooltip.
       const hit = svgEl('rect', {
-        x: m.left + band * idx, y: m.top, width: band, height: plotH, fill: 'transparent',
+        x: m.left + band * slotAt[idx], y: m.top,
+        width: band * folds[idx], height: plotH, fill: 'transparent',
       });
       hit.addEventListener('mousemove', (e) =>
         showTip(e, `Call ${p.i + 1} of ${allPoints.length}`, tipRows(p, idx)));
@@ -1651,7 +1877,11 @@ function renderSessionDetail(session, events) {
       const rect = svg.getBoundingClientRect();
       const rel = ((e.clientX - rect.left) / rect.width) * W;
       const ratio = (rel - m.left) / plotW;
-      const idx = Math.max(0, Math.min(points.length - 1, Math.round(ratio * (points.length - 1))));
+      // Resolved through slot space, matching the path: anywhere over a folded
+      // turn's plateau reports that turn, so the whole width of a fold is one
+      // hover target exactly as its single bar-mode target is.
+      const slot = Math.max(0, Math.min(slotCount - 1, Math.round(ratio * slotSpan)));
+      const idx = pointAtSlot[slot];
       const p = points[idx];
       showTip(e, `Call ${p.i + 1} of ${allPoints.length}`, tipRows(p, idx));
     });
@@ -1678,11 +1908,21 @@ function renderSessionDetail(session, events) {
   // Pointer position is converted to a fractional call index, so wheel-zoom
   // keeps whatever is under the cursor pinned in place rather than always
   // zooming to the middle.
+  // Converted through slots rather than straight from the width fraction: once
+  // folding is in play a slot is not a call, so a plain fraction would name a
+  // call the cursor is not over and zoom would slide sideways as it went in.
+  // Reads as the original formula when nothing is folded, where slots and calls
+  // are one to one.
   const callAt = (clientX) => {
     const rect = svg.getBoundingClientRect();
     const rel = ((clientX - rect.left) / rect.width) * W;
     const ratio = Math.max(0, Math.min(1, (rel - m.left) / plotW));
-    return view.start + ratio * (view.end - view.start);
+    const slot = Math.max(0, Math.min(slotCount - 1, Math.round(ratio * slotSpan)));
+    // Fractional within the hovered point, so panning stays smooth rather than
+    // snapping call by call.
+    const idx = pointAtSlot[slot];
+    const within = folds[idx] > 1 ? (slot - slotAt[idx]) / folds[idx] : 0;
+    return view.start + idx + within;
   };
 
   const applyZoom = (next) => {
@@ -1772,6 +2012,13 @@ function renderSessionDetail(session, events) {
         `Each square is 1% of a 5-hour window (~${compact(moneyGrid.value)} output tokens, ` +
         `or ~${compact(QUOTA_CACHE_WRITE_TOKENS_PER_PERCENT)} cache-write tokens)` +
         (useBars ? ' — measured per column band, not the drawn bar width. ' : '. ') +
+        // Squares are the unit folding is meant to preserve, so the note says how
+        // to count one: across the whole run, not per slice. Without this the
+        // grid and the "1 of N" label describe the same turn two different ways
+        // and the reader has to guess which to trust.
+        (foldedCount
+          ? 'A folded turn is counted across all its slices. '
+          : '') +
         quotaCalibrationNote(points);
     } else {
       gridNote.textContent = useBars
@@ -1816,6 +2063,17 @@ function renderSessionDetail(session, events) {
       : '') +
     (clipped
       ? `<span class="item muted">${clipped} call${clipped > 1 ? 's' : ''} above ${fmtAxisUSD(costCeiling)} clipped to the top — hover for the real figure</span>`
+      : '') +
+    // Folding is disclosed in the legend as well as on the bars: the per-slice
+    // labels vanish on a narrow plot, and the reader still needs to know that
+    // some columns are one turn rather than several.
+    (foldedCount
+      ? `<span class="item muted">${foldedCount} turn${foldedCount > 1 ? 's' : ''} ` +
+        `folded into slices to fit the scale — full area preserved, hover for the total</span>`
+      : '') +
+    (foldOverflow
+      ? `<span class="item muted">${foldOverflow} still above the axis at the ` +
+        `${FOLD_MAX}-slice limit</span>`
       : '');
 
   // The table mirrors whichever mode is showing, so the chart's units and the
