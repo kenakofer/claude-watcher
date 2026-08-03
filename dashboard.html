@@ -1016,13 +1016,29 @@ function renderSessionDetail(session, events) {
   // parent's height returns "the old chart plus slack" and the chart grows by
   // that slack on every single render. The viewport is the one height in this
   // chain that a render cannot change.
+  // Margins included: getBoundingClientRect() leaves them out, and these rows
+  // carry a dozen-odd pixels each (.legend, .modes, .grid-note) — enough that
+  // omitting them overshoots the viewport by ~100px.
   const used = [...host.parentElement.children]
     .filter((c) => c !== host)
-    .reduce((a, c) => a + c.getBoundingClientRect().height, 0);
-  // The card is capped at calc(100vh - 32px) by the wide layout; the rest is
-  // its own chrome (padding + the summary row). Constants rather than measured
-  // offsets, so scrolling the page cannot change the chart's height.
-  const H = Math.max(Math.floor(innerHeight - 32 - 62 - used), 420);
+    .reduce((a, c) => {
+      const s = getComputedStyle(c);
+      return a + c.getBoundingClientRect().height
+        + parseFloat(s.marginTop) + parseFloat(s.marginBottom);
+    }, 0);
+  // The card is capped at calc(100vh - 32px) by the wide layout. Its remaining
+  // chrome is measured rather than assumed — the summary row plus the card and
+  // body padding, none of which depend on the drawing, so measuring them cannot
+  // feed the sizing loop the way reading a content height would.
+  const card = el('detail-card');
+  const summary = card.querySelector(':scope > summary');
+  const cs = getComputedStyle(card);
+  const bs = getComputedStyle(host.parentElement);
+  const chrome = summary.getBoundingClientRect().height
+    + parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom)
+    + parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth)
+    + parseFloat(bs.paddingTop) + parseFloat(bs.paddingBottom);
+  const H = Math.max(Math.floor(innerHeight - 32 - chrome - used), 420);
   host.style.setProperty('--detail-chart-h', `${H}px`);
   // Right margin holds the cumulative-cost axis labels.
   const m = { top: 16, right: 56, bottom: 30, left: costMode ? 68 : 62 };
