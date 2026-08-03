@@ -1309,7 +1309,13 @@ function renderSessionDetail(session, events) {
   const band = plotW / slotCount;
   const useBars = band >= MIN_BAR_BAND_PX;
   const BAR_GAP = 2;
-  const barW = Math.max(1, band - BAR_GAP);
+  // Drawn width of a turn occupying `n` slots — one gap total, at the outer
+  // edges, however many slots it spans. An unfolded turn is just n = 1, so this
+  // is the old `band - BAR_GAP` and folding is the general case rather than a
+  // special one. The gap is not multiplied per slice: inside a fold there is no
+  // turn boundary to show, and charging a gap per slice under-drew a folded
+  // turn's area by up to 54% against the quantity it is supposed to encode.
+  const runWidth = (n) => Math.max(1, band * n - BAR_GAP);
   // The centre of a point's *whole* run of slots, so the cumulative line and the
   // compaction markers still land on the middle of what they refer to.
   //
@@ -1519,21 +1525,28 @@ function renderSessionDetail(session, events) {
         const yTop = y(upper[i]);
         const h = y(lower[i]) - yTop;
         if (h <= 0) return;
-        // A folded turn emits one rect per slice, each in its own slot at the
-        // shared 1/N height. Drawn as separate rects rather than one wide one so
-        // the BAR_GAP falls between slices too — that gap is what makes the
-        // slices countable and stops the fold reading as a single fat bar.
+        // A folded turn is ONE rect spanning all its slots, not one per slice.
         //
-        // Centred on the slot rather than inset from its left edge, so that when
-        // `barW` hits its 1px floor on a sub-pixel band the overhang is split
+        // BAR_GAP exists to show where one turn ends and the next begins. Inside
+        // a fold there is no such boundary — the slices are a single turn — so a
+        // gap there draws a division that isn't in the data, and it read as
+        // several short turns rather than one tall one. The gap is kept at the
+        // outer edges, which are real turn boundaries.
+        //
+        // What separates the slices instead is the tie bar and the "1 of N"
+        // labels above: those say "one turn, N slices" without claiming the ink
+        // underneath is discontinuous. Countability was the reason for the
+        // per-slice gap, and the labels do that job without the false boundary.
+        //
+        // Centred on the run rather than inset from its left edge, so that when
+        // the width hits its 1px floor on a sub-pixel band the overhang is split
         // evenly instead of pushing the last bar past the right edge of the plot.
-        for (let k = 0; k < folds[i]; k += 1) {
-          svg.appendChild(svgEl('rect', {
-            x: m.left + band * (slotAt[i] + k + 0.5) - barW / 2, y: yTop,
-            width: barW, height: h,
-            fill: s.color, 'fill-opacity': 0.85,
-          }));
-        }
+        const runW = runWidth(folds[i]);
+        svg.appendChild(svgEl('rect', {
+          x: m.left + band * (slotAt[i] + folds[i] / 2) - runW / 2, y: yTop,
+          width: runW, height: h,
+          fill: s.color, 'fill-opacity': 0.85,
+        }));
       });
     } else {
       // Forward along the top edge, back along the bottom edge.
@@ -1582,9 +1595,9 @@ function renderSessionDetail(session, events) {
   // bracket alone, which still groups the slices visually.
   //
   // Both modes label the same way, off the same slot geometry; only the edges
-  // differ. Bars own a band each and are inset by the gap that separates them;
-  // the area path has no gaps, so its run is measured centre to centre and the
-  // tie bar sits flush with the plateau it spans.
+  // differ. A bar-mode fold is one rect inset by the gap that separates it from
+  // the turns either side; the area path has no gaps, so its run is measured
+  // centre to centre and the tie bar sits flush with the plateau it spans.
   if (usageMode && foldedCount) {
     // Per-slot width available to a label, which is what decides whether the
     // text fits — the band in bar mode, the slot pitch in area mode.
@@ -1593,13 +1606,14 @@ function renderSessionDetail(session, events) {
       const n = folds[i];
       if (n < 2) return;
       const yTop = y(p.usageTotal / n);
-      // Flush with the outer edges of the first and last slice, matching how
-      // those rects are centred on their slots.
+      // Flush with the outer edges of the run, matching the single rect the
+      // fold now draws.
+      const runW = runWidth(n);
       const runL = useBars
-        ? m.left + band * (slotAt[i] + 0.5) - barW / 2
+        ? m.left + band * (slotAt[i] + n / 2) - runW / 2
         : xSlot(slotAt[i]);
       const runR = useBars
-        ? m.left + band * (slotAt[i] + n - 0.5) + barW / 2
+        ? m.left + band * (slotAt[i] + n / 2) + runW / 2
         : xSlot(slotAt[i] + n - 1);
       // ~7px per character at this size; below that the label overlaps its
       // neighbour and the slot number is unreadable anyway.
@@ -1610,6 +1624,21 @@ function renderSessionDetail(session, events) {
         x1: runL, x2: runR, y1: yTop - 4, y2: yTop - 4,
         stroke: 'var(--text-secondary)', 'stroke-width': 1, 'stroke-opacity': 0.5,
       }));
+      // Ticks on the tie bar where the slices divide. The bar itself is now one
+      // continuous rect, so these are the only marks left showing how many
+      // slices it is — and they sit above the data rather than cutting into it,
+      // which is the difference between annotating the fold and faking a gap in
+      // the turn. Drawn in bar mode only: the area path has no discrete slices
+      // to divide, just a plateau.
+      if (useBars) {
+        for (let k = 1; k < n; k += 1) {
+          const tx = m.left + band * (slotAt[i] + k);
+          svg.appendChild(svgEl('line', {
+            x1: tx, x2: tx, y1: yTop - 6, y2: yTop - 2,
+            stroke: 'var(--text-secondary)', 'stroke-width': 1, 'stroke-opacity': 0.5,
+          }));
+        }
+      }
       if (!fits) return;
       for (let k = 0; k < n; k += 1) {
         const label = svgEl('text', {
