@@ -31,10 +31,11 @@ node watcher.js
 Open <http://localhost:4791>. The page updates live as Claude Code writes.
 
 ```
-node watcher.js [--projects <dir>] [--port <n>] [--poll <ms>]
+node watcher.js [--projects <dir>] [--port <n>] [--host <addr>] [--poll <ms>]
 
   --projects  transcript root            (default ~/.claude/projects)
   --port      HTTP/SSE port              (default 4791)
+  --host      bind address               (default 127.0.0.1 — see Privacy)
   --poll      filesystem poll interval   (default 1000ms)
 ```
 
@@ -113,6 +114,27 @@ agents — **no OpenTelemetry export or environment setup is required**.
 Compaction is also explicit rather than inferred. A `compact_boundary` system
 entry carries `preTokens`, `postTokens`, and the trigger, so the markers on the
 context chart are exact boundaries, not a guess at a drop in the trend.
+
+## Privacy
+
+Your transcripts contain your prompts. This tool reads them, and the HTTP API
+serves them back verbatim — `/api/events` includes prompt text, session titles,
+the working directory of each session, and git branch names. There is no
+authentication on any endpoint.
+
+Two consequences worth being deliberate about:
+
+- **The server binds to `127.0.0.1` by default**, so only your own machine can
+  reach it. `--host 0.0.0.0` opens it to the whole network; on shared or public
+  WiFi that publishes your prompts to anyone who can reach the port. The flag
+  exists for people who genuinely want a dashboard on another device, and it
+  prints a warning when used.
+- **Nothing is sent anywhere.** No telemetry, no external calls; the process
+  reads local files and serves them on a local port. The pricing table is a
+  static file in this repo, not a lookup.
+
+Screenshots of the dashboard show real prompt text and project paths. Worth a
+look before posting one.
 
 ### Normalized events
 

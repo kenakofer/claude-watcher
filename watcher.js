@@ -20,6 +20,12 @@ const DEFAULTS = {
   projects: path.join(os.homedir(), '.claude', 'projects'),
   port: 4791,
   pollMs: 1000,
+  // Loopback, not every interface. The API serves prompt text, session titles,
+  // working directories and branch names with no authentication, so binding to
+  // 0.0.0.0 — which is what listen(port) does when no host is given — publishes
+  // the contents of every transcript to whatever network the machine is on.
+  // Opt in with --host if you actually want that; it is never the safe default.
+  host: '127.0.0.1',
 };
 
 function parseArgs(argv) {
@@ -29,6 +35,7 @@ function parseArgs(argv) {
     const next = () => argv[++i];
     if (arg === '--projects') opts.projects = path.resolve(next());
     else if (arg === '--port') opts.port = Number(next());
+    else if (arg === '--host') opts.host = next();
     else if (arg === '--poll') opts.pollMs = Number(next());
     else if (arg === '--help' || arg === '-h') opts.help = true;
     else throw new Error(`unknown argument: ${arg}`);
@@ -38,10 +45,12 @@ function parseArgs(argv) {
 
 const HELP = `claude-session-watcher
 
-  node watcher.js [--projects <dir>] [--port <n>] [--poll <ms>]
+  node watcher.js [--projects <dir>] [--port <n>] [--host <addr>] [--poll <ms>]
 
   --projects  Claude Code transcript root (default ~/.claude/projects)
   --port      HTTP/SSE port (default ${DEFAULTS.port})
+  --host      bind address (default ${DEFAULTS.host}). The API is unauthenticated
+              and serves prompt text, so only widen this on a network you trust.
   --poll      filesystem poll interval in ms (default ${DEFAULTS.pollMs})
 
 Endpoints:
@@ -809,9 +818,19 @@ async function main() {
   );
 
   const server = createServer(opts);
-  server.listen(opts.port, () => {
-    console.log(`[watcher] dashboard  http://localhost:${opts.port}`);
+  server.listen(opts.port, opts.host, () => {
+    // Reports the address actually bound, not a hardcoded "localhost". The old
+    // line said localhost while listening on every interface, which is the one
+    // combination that hides the thing worth knowing.
+    const shown = opts.host === '0.0.0.0' || opts.host === '::' ? opts.host : 'localhost';
+    console.log(`[watcher] dashboard  http://${shown}:${opts.port}`);
     console.log(`[watcher] watching   ${opts.projects}`);
+    if (shown !== 'localhost') {
+      console.log(
+        '[watcher] WARNING   bound to all interfaces; the API is unauthenticated '
+          + 'and serves prompt text',
+      );
+    }
   });
 
   let scanning = false;
